@@ -19,7 +19,8 @@ from config import (
 )
 from core.data_manager import db
 from core.state import state
-from helpers.embeds import get_custom_embed
+from helpers.embeds import clamp_embed, get_custom_embed
+from helpers.permissions import is_admin
 from helpers.stats import (
     channel_name,
     create_channel_report,
@@ -108,25 +109,29 @@ class CustomerView(ui.View):
 # =========================================================
 #  DROPDOWN CHỌN KÊNH — PERSISTENT
 # =========================================================
-class UserChannelSelect(ui.Select):
-    def __init__(self):
-        channels = db.load("channels")
-        options: list[discord.SelectOption] = []
-        if not channels:
-            options.append(discord.SelectOption(label="Chưa có kênh nào", value="none"))
-        else:
-            for cid, data in channels.items():
-                options.append(discord.SelectOption(
-                    label=data.get("name", f"Kênh {cid}"),
-                    value=cid,
-                ))
-        options = options[:25]
+# Discord: mỗi menu tối đa 25 lựa chọn, mỗi tin nhắn tối đa 5 menu → tối đa 125 kênh
+OPTIONS_PER_SELECT = 25
+MAX_SELECTS = 5
 
+
+def _select_custom_id(index: int) -> str:
+    # Menu đầu giữ custom_id cũ để panel đã gửi trước đây vẫn bấm được
+    return "user_channel_select" if index == 0 else f"user_channel_select_{index + 1}"
+
+
+class UserChannelSelect(ui.Select):
+    def __init__(self, options: list[discord.SelectOption], index: int, total_groups: int):
+        if total_groups > 1:
+            first = index * OPTIONS_PER_SELECT + 1
+            last = first + len(options) - 1
+            placeholder = f"Chọn kênh để theo dõi... ({first}–{last})"
+        else:
+            placeholder = "Chọn kênh để theo dõi..."
         super().__init__(
-            placeholder="Chọn kênh để theo dõi...",
+            placeholder=placeholder,
             min_values=1,
             max_values=1,
-            custom_id="user_channel_select",
+            custom_id=_select_custom_id(index),
             options=options,
         )
 
@@ -145,6 +150,13 @@ class UserChannelSelect(ui.Select):
         channels_data = db.load("channels")
         ctv_data = db.load("ctv")
 
+        if channel_id not in channels_data:
+            await interaction.followup.send(
+                "⚠️ Kênh này không còn trong hệ thống. Bảng chọn sẽ tự cập nhật.",
+                ephemeral=True,
+            )
+            return
+
         # ==== [1] KIỂM TRA QUYỀN TRUY CẬP CỦA CTV ====
         if user_id in ctv_data and channel_id not in ctv_data[user_id]:
             await interaction.followup.send(
@@ -156,6 +168,15 @@ class UserChannelSelect(ui.Select):
 
         # ==== [2] XỬ LÝ ROLE (skip nếu kênh Công khai — không có role) ====
         target_role_id = channels_data.get(channel_id, {}).get("role_id", 0)
+
+        # Không gỡ role của những kênh mà người này là CTV (tránh mất quyền vào kênh của mình),
+        # và không gỡ role nào của admin.
+        protected_role_ids = {
+            channels_data.get(c, {}).get("role_id")
+            for c in (ctv_data.get(user_id) or [])
+            if channels_data.get(c, {}).get("role_id")
+        }
+        skip_role_removal = is_admin(user)
 
         if target_role_id:
             # PRIVATE mode: gán role kênh này, thu hồi role các kênh khác
@@ -170,8 +191,9 @@ class UserChannelSelect(ui.Select):
                 roles_to_remove = [
                     r for r in user.roles
                     if r.id in all_managed_role_ids and r.id != target_role_id
+                    and r.id not in protected_role_ids
                 ]
-                if roles_to_remove:
+                if roles_to_remove and not skip_role_removal:
                     await user.remove_roles(*roles_to_remove)
 
                 if target_role and target_role not in user.roles:
@@ -199,9 +221,9 @@ class UserChannelSelect(ui.Select):
                 }
                 roles_to_remove = [
                     r for r in user.roles
-                    if r.id in all_managed_role_ids
+                    if r.id in all_managed_role_ids and r.id not in protected_role_ids
                 ]
-                if roles_to_remove:
+                if roles_to_remove and not skip_role_removal:
                     await user.remove_roles(*roles_to_remove)
             except discord.Forbidden:
                 pass
@@ -303,7 +325,7 @@ class UserChannelSelect(ui.Select):
                 f"{current_desc}\n\n{status_line}\n\n"
                 f"**{section_title}**\n{section_text}"
             )
-            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            await interaction.followup.send(embed=clamp_embed(embed), view=view, ephemeral=True)
         else:
             view = CustomerView(
                 channel_id, guild.id, show_as_live, user.id,
@@ -336,7 +358,7 @@ class UserChannelSelect(ui.Select):
                 f"{current_desc}\n\n{status_line}\n\n"
                 f"**{section_title}**\n{section_text}"
             )
-            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            await interaction.followup.send(embed=clamp_embed(embed), view=view, ephemeral=True)
 
         # ==== [6] RESET DROPDOWN ====
         try:
@@ -348,4 +370,19 @@ class UserChannelSelect(ui.Select):
 class UserSelectView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(UserChannelSelect())
+        channels = db.load("channels")
+        options = [
+            discord.SelectOption(label=(data.get("name") or f"Kênh {cid}")[:100], value=cid)
+            for cid, data in channels.items()
+        ]
+        if not options:
+            options = [discord.SelectOption(label="Chưa có kênh nào", value="none")]
+
+        limit = OPTIONS_PER_SELECT * MAX_SELECTS
+        if len(options) > limit:
+            log.warning(f"Có {len(options)} kênh — panel khách chỉ hiện được {limit} kênh đầu")
+            options = options[:limit]
+
+        groups = [options[i:i + OPTIONS_PER_SELECT] for i in range(0, len(options), OPTIONS_PER_SELECT)]
+        for idx, group in enumerate(groups):
+            self.add_item(UserChannelSelect(group, idx, len(groups)))

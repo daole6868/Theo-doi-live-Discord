@@ -8,7 +8,8 @@ import logging
 
 from discord.ext import commands
 
-from helpers.panels import refresh_panel, PANEL_CHANNELS
+from core.session_store import store
+from helpers.panels import PANEL_CHANNELS, PANEL_VERSION, refresh_panel
 
 log = logging.getLogger(__name__)
 
@@ -16,6 +17,25 @@ log = logging.getLogger(__name__)
 class AdminCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._panels_checked = False
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        """Sau khi nâng cấp bot (panel đổi cấu trúc) → tự gửi lại các panel 1 lần."""
+        if self._panels_checked:
+            return
+        self._panels_checked = True
+        if store.get_meta("panel_version") == PANEL_VERSION:
+            return
+        for panel_name, channel_id in PANEL_CHANNELS.items():
+            if not channel_id:
+                continue
+            try:
+                await refresh_panel(self.bot, panel_name)
+            except Exception:
+                log.exception(f"Tự làm mới panel {panel_name} lỗi")
+        store.set_meta("panel_version", PANEL_VERSION)
+        log.info(f"✓ Đã làm mới panel lên phiên bản {PANEL_VERSION}")
 
     @commands.command(name="setup")
     @commands.has_permissions(administrator=True)

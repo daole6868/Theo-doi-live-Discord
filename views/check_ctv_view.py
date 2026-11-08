@@ -2,7 +2,8 @@
 Dashboard check thời gian live của CTV.
 
 UX mới:
-- Chọn CTV từ dropdown → default HÔM NAY (chi tiết phiên hôm nay).
+- Chọn CTV bằng ô chọn thành viên (gõ tên) → default HÔM NAY (chi tiết phiên hôm nay).
+  Xem được cả người đã nghỉ (lịch sử vẫn giữ).
 - Bấm "7 ngày" hoặc "15 ngày" → summary theo ngày + nút mỗi ngày để drill-down.
 - Bấm 1 nút ngày cụ thể → chi tiết phiên của ngày đó.
 """
@@ -13,7 +14,6 @@ import discord
 from discord import ui
 
 from config import CHECK_RANGE_OPTIONS
-from core.data_manager import db
 from helpers.stats import create_ctv_report
 from helpers.time_utils import now_vn
 
@@ -116,67 +116,36 @@ class CheckCTVDetailView(ui.View):
 
 
 # =========================================================
-#  CHECK CTV DROPDOWN (persistent)
+#  CHECK CTV — ô chọn thành viên (persistent, gõ tên để tìm)
 # =========================================================
-class CheckCTVSelect(ui.Select):
+class CheckCTVSelect(ui.UserSelect):
     def __init__(self):
-        ctv_data = db.load("ctv")
-        channels_data = db.load("channels")
-        options: list[discord.SelectOption] = []
-
-        if not ctv_data:
-            options.append(discord.SelectOption(label="Chưa có CTV nào", value="none"))
-        else:
-            for user_id, channel_list in ctv_data.items():
-                if not isinstance(channel_list, list):
-                    channel_list = []
-                names = [channels_data.get(cid, {}).get("name", "?") for cid in channel_list]
-                desc = f"Quản lý: {', '.join(names)}" if names else "Chưa có kênh"
-                if len(desc) > 100:
-                    desc = desc[:97] + "..."
-
-                options.append(discord.SelectOption(
-                    label=f"CTV ID: {user_id}",
-                    value=str(user_id),
-                    description=desc,
-                ))
-        options = options[:25]
-
         super().__init__(
-            placeholder="Chọn CTV để xem thời gian live...",
+            placeholder="Gõ tên CTV để xem thời gian live...",
             min_values=1,
             max_values=1,
-            custom_id="check_ctv_select",
-            options=options,
+            custom_id="check_ctv_user_select",
         )
 
     async def callback(self, interaction: discord.Interaction):
-        value = self.values[0]
+        picked = self.values[0]
+        value = str(picked.id)
 
-        if value == "none":
+        embed = create_ctv_report(value, 1)  # Mặc định: HÔM NAY
+        if embed.title and embed.title.startswith("❌"):
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            view = CheckCTVDetailView(value, current=1, selected_day=None)
             await interaction.response.send_message(
-                "Chưa có CTV nào trong hệ thống.",
+                content=f"📋 Đang xem: **{picked.display_name}** (`{value}`)",
+                embed=embed,
+                view=view,
                 ephemeral=True,
             )
-            return
 
-        member = interaction.guild.get_member(int(value)) if value.isdigit() else None
-        display = f"{member.display_name} (`{value}`)" if member else f"CTV `{value}`"
-
-        # Default: HÔM NAY (chi tiết phiên hôm nay)
-        embed = create_ctv_report(value, 1)
-        view = CheckCTVDetailView(value, current=1, selected_day=None)
-        await interaction.response.send_message(
-            content=f"📋 Đang xem: **{display}**",
-            embed=embed,
-            view=view,
-            ephemeral=True,
-        )
-
-        # Rebuild dropdown panel
+        # Bỏ lựa chọn cũ trên panel để người sau chọn lại được
         try:
-            new_panel = CheckCTVPanelView()
-            await interaction.message.edit(view=new_panel)
+            await interaction.message.edit(view=CheckCTVPanelView())
         except Exception:
             log.exception("Rebuild CheckCTV panel lỗi")
 

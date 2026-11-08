@@ -17,6 +17,7 @@ import discord
 from discord import ui
 
 from core.data_manager import db
+from helpers.embeds import TEMPLATE_DESCRIPTION_MAX, clamp_embed, is_valid_image_url
 from helpers.panels import refresh_panel
 
 log = logging.getLogger(__name__)
@@ -44,8 +45,8 @@ FIELD_CONFIG: dict[str, dict] = {
     "description": {
         "btn_label": "📄 Sửa Nội Dung",
         "modal_title": "Sửa Nội Dung",
-        "input_label": "Nội dung",
-        "max_length": 4000,
+        "input_label": "Nội dung (tối đa 2000 ký tự)",
+        "max_length": TEMPLATE_DESCRIPTION_MAX,
         "style": discord.TextStyle.paragraph,
         "placeholder": "Nhập nội dung mới...",
     },
@@ -93,13 +94,13 @@ def build_preview_embed(embed_key: str) -> discord.Embed:
         color=discord.Color.blurple(),
     )
 
-    if data.get("thumbnail"):
-        embed.set_thumbnail(url=data["thumbnail"])
-    if data.get("image"):
-        embed.set_image(url=data["image"])
+    if is_valid_image_url(data.get("thumbnail")):
+        embed.set_thumbnail(url=data["thumbnail"].strip())
+    if is_valid_image_url(data.get("image")):
+        embed.set_image(url=data["image"].strip())
 
     embed.set_footer(text=data.get("footer") or "(Chưa có footer — bấm 📎 để sửa)")
-    return embed
+    return clamp_embed(embed)
 
 
 # =========================================================
@@ -130,8 +131,20 @@ class EditSingleFieldModal(ui.Modal):
         self.add_item(self.value_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # 1. Save DB
         new_value = self.value_input.value
+
+        # 0. Kiểm tra link ảnh trước khi lưu (link sai làm Discord từ chối cả tin nhắn)
+        if self.field in ("image", "thumbnail"):
+            new_value = new_value.strip()
+            if new_value and not is_valid_image_url(new_value):
+                await interaction.response.send_message(
+                    "⚠️ Link ảnh không hợp lệ — phải bắt đầu bằng `http://` hoặc `https://` "
+                    "và không có khoảng trắng. Chưa lưu thay đổi.",
+                    ephemeral=True,
+                )
+                return
+
+        # 1. Save DB
 
         def _save(embeds):
             embeds.setdefault(self.embed_key, {})[self.field] = new_value

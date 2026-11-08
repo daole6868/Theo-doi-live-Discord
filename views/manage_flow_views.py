@@ -6,9 +6,10 @@ QUẢN LÝ KÊNH:
 - Xóa khỏi Bot (giữ voice channel + role Discord)
 - Xóa hoàn toàn (xóa cả voice channel + role Discord)
 
-QUẢN LÝ CTV:
+QUẢN LÝ CTV (chọn bằng ô chọn thành viên của Discord — gõ tên để tìm):
 - Bỏ khỏi 1 kênh cụ thể (thu hồi role của kênh đó)
 - Xóa hoàn toàn (bỏ khỏi tất cả kênh + thu hồi mọi role liên quan)
+- Xóa lịch sử live (cả với người đã nghỉ)
 
 Thao tác nguy hiểm luôn qua ConfirmView (Xác nhận / Hủy).
 
@@ -22,7 +23,7 @@ from discord import ui
 
 from core.data_manager import db
 from core.session_store import store
-from helpers.panels import refresh_panel
+from helpers.panels import refresh_panel, resync_tracking
 
 log = logging.getLogger(__name__)
 
@@ -59,30 +60,23 @@ class ConfirmView(ui.View):
 # =========================================================
 #  QUẢN LÝ KÊNH — dropdown chọn kênh
 # =========================================================
-class ManageChannelSelect(ui.Select):
-    def __init__(self):
-        channels = db.load("channels")
-        options: list[discord.SelectOption] = []
-        if not channels:
-            options.append(discord.SelectOption(label="Chưa có kênh nào", value="none"))
-        else:
-            for cid, data in channels.items():
-                options.append(discord.SelectOption(
-                    label=data.get("name", f"Kênh {cid}"),
-                    value=cid,
-                    description=f"ID: {cid}",
-                ))
-        options = options[:25]
+class ManageChannelSelect(ui.ChannelSelect):
+    """Chọn kênh cần quản lý (gõ để tìm, không giới hạn 25)."""
 
+    def __init__(self):
         super().__init__(
-            placeholder="Chọn kênh cần quản lý...",
-            options=options,
+            placeholder="Gõ tên kênh voice cần quản lý...",
+            channel_types=[discord.ChannelType.voice],
+            min_values=1,
+            max_values=1,
         )
 
     async def callback(self, interaction: discord.Interaction):
-        cid = self.values[0]
-        if cid == "none":
-            await interaction.response.send_message("Chưa có kênh nào.", ephemeral=True)
+        cid = str(self.values[0].id)
+        if cid not in db.load("channels"):
+            await interaction.response.send_message(
+                "⚠️ Kênh này chưa có trong hệ thống bot.", ephemeral=True,
+            )
             return
 
         channels = db.load("channels")
@@ -256,6 +250,7 @@ class ChannelActionView(ui.View):
             done.append("🔄 User + Check CTV panel đã cập nhật")
         except Exception:
             log.exception("Refresh panels lỗi")
+        await resync_tracking(interaction.client, "xóa kênh")
 
         result = "\n".join(done)
         await interaction.followup.send(
@@ -338,50 +333,41 @@ class RenameChannelModal(ui.Modal):
 # =========================================================
 #  QUẢN LÝ CTV — dropdown chọn CTV
 # =========================================================
-class ManageCTVSelect(ui.Select):
+class ManageCTVSelect(ui.UserSelect):
+    """Chọn CTV cần quản lý (gõ tên để tìm, không giới hạn 25)."""
+
     def __init__(self):
-        ctv_data = db.load("ctv")
-        channels_data = db.load("channels")
-        options: list[discord.SelectOption] = []
-
-        if not ctv_data:
-            options.append(discord.SelectOption(label="Chưa có CTV nào", value="none"))
-        else:
-            for uid, channel_list in ctv_data.items():
-                if not isinstance(channel_list, list):
-                    channel_list = []
-                names = [channels_data.get(cid, {}).get("name", "?") for cid in channel_list]
-                desc = f"Quản lý: {', '.join(names)}" if names else "Chưa có kênh"
-                if len(desc) > 100:
-                    desc = desc[:97] + "..."
-
-                options.append(discord.SelectOption(
-                    label=f"CTV ID: {uid}",
-                    value=str(uid),
-                    description=desc,
-                ))
-        options = options[:25]
-
-        super().__init__(
-            placeholder="Chọn CTV cần quản lý...",
-            options=options,
-        )
+        super().__init__(placeholder="Gõ tên CTV cần quản lý...", min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
-        uid = self.values[0]
-        if uid == "none":
-            await interaction.response.send_message("Chưa có CTV nào.", ephemeral=True)
-            return
-
+        picked = self.values[0]
+        uid = str(picked.id)
         ctv_data = db.load("ctv")
         channels_data = db.load("channels")
+        display = f"{picked.display_name} (`{uid}`)"
+
+        if uid not in ctv_data:
+            if store.has_history(uid):
+                embed = discord.Embed(
+                    title="🔧 Quản lý CTV",
+                    description=(
+                        f"**{display}** không còn là CTV nhưng vẫn còn lịch sử live.\n"
+                        "Bạn có thể xóa lịch sử nếu cần."
+                    ),
+                    color=discord.Color.blurple(),
+                )
+                await interaction.response.send_message(
+                    embed=embed, view=HistoryOnlyView(uid), ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    f"ℹ️ **{display}** không phải CTV.", ephemeral=True,
+                )
+            return
+
         channel_list = ctv_data.get(uid, [])
         if not isinstance(channel_list, list):
             channel_list = []
-
-        member = interaction.guild.get_member(int(uid)) if uid.isdigit() else None
-        display = f"{member.display_name} (`{uid}`)" if member else f"CTV `{uid}`"
-
         channels_info = "\n".join(
             f"• **{channels_data.get(cid, {}).get('name', '?')}** (id: `{cid}`)"
             for cid in channel_list
@@ -409,27 +395,40 @@ class ManageCTVSelectView(ui.View):
 # =========================================================
 #  CTV ACTION VIEW — nút cho từng kênh + nút xóa hoàn toàn
 # =========================================================
+class RemoveFromChannelSelect(ui.Select):
+    """Chọn 1 kênh để bỏ CTV khỏi kênh đó."""
+
+    def __init__(self, action_view: "CTVActionView", channel_list: list, channels_data: dict):
+        options = [
+            discord.SelectOption(
+                label=f"Bỏ khỏi: {channels_data.get(cid, {}).get('name', '?')}"[:100],
+                value=str(cid),
+                description=f"ID: {cid}",
+            )
+            for cid in channel_list[:25]
+        ]
+        super().__init__(placeholder="Bỏ CTV khỏi 1 kênh...", options=options, row=0)
+        self.action_view = action_view
+        self.names = {str(cid): channels_data.get(cid, {}).get("name", "?") for cid in channel_list}
+
+    async def callback(self, interaction: discord.Interaction):
+        cid = self.values[0]
+        handler = self.action_view._make_remove_from_channel_handler(cid, self.names.get(cid, "?"))
+        await handler(interaction)
+
+
 class CTVActionView(ui.View):
     def __init__(self, user_id: str, channel_list: list, channels_data: dict):
         super().__init__(timeout=300)
         self.user_id = user_id
 
-        # Nút "Bỏ khỏi kênh X" cho từng kênh (max 4 để chừa chỗ)
-        for idx, cid in enumerate(channel_list[:4]):
-            name = channels_data.get(cid, {}).get("name", "?")
-            btn = ui.Button(
-                label=f"Bỏ khỏi: {name[:40]}",
-                style=discord.ButtonStyle.secondary,
-                row=idx // 2,
-            )
-            btn.callback = self._make_remove_from_channel_handler(cid, name)
-            self.add_item(btn)
+        if channel_list:
+            self.add_item(RemoveFromChannelSelect(self, channel_list, channels_data))
 
-        # Nút "Xóa hoàn toàn" ở row cuối
         full_btn = ui.Button(
             label="❌ Xóa CTV HOÀN TOÀN",
             style=discord.ButtonStyle.danger,
-            row=4,
+            row=1,
         )
         full_btn.callback = self._remove_full_handler
         self.add_item(full_btn)
@@ -437,7 +436,7 @@ class CTVActionView(ui.View):
         history_btn = ui.Button(
             label="🗑️ Xóa lịch sử live",
             style=discord.ButtonStyle.danger,
-            row=4,
+            row=1,
         )
         history_btn.callback = self._delete_history_handler
         self.add_item(history_btn)
@@ -506,11 +505,12 @@ class CTVActionView(ui.View):
         except Exception:
             log.exception("Thu hồi role lỗi")
 
-        # 3. Refresh
+        # 3. Refresh + đối chiếu lại bộ tính giờ (ngừng tính nếu không còn là CTV)
         try:
             await refresh_panel(interaction.client, "check_ctv")
         except Exception:
             log.exception("Refresh check_ctv panel lỗi")
+        await resync_tracking(interaction.client, "cập nhật CTV")
 
         extra = "\n✓ Đã xóa CTV khỏi hệ thống (không còn kênh nào)" if removed_all else ""
         role_text = "\n✓ Đã thu hồi role" if role_removed else "\n⚠️ Không thu hồi được role (thiếu quyền hoặc user không có role)"
@@ -575,11 +575,12 @@ class CTVActionView(ui.View):
         except Exception:
             log.exception("Thu hồi role lỗi")
 
-        # 3. Refresh
+        # 3. Refresh + đối chiếu lại bộ tính giờ (ngừng tính nếu không còn là CTV)
         try:
             await refresh_panel(interaction.client, "check_ctv")
         except Exception:
             log.exception("Refresh check_ctv panel lỗi")
+        await resync_tracking(interaction.client, "cập nhật CTV")
 
         await interaction.followup.send(
             f"✅ Đã xóa hoàn toàn CTV <@{self.user_id}>.\n"
@@ -590,6 +591,18 @@ class CTVActionView(ui.View):
             ephemeral=True,
         )
         log.warning(f"Admin {interaction.user} xóa hoàn toàn CTV {self.user_id}")
+
+
+class HistoryOnlyView(ui.View):
+    """Người đã nghỉ (không còn là CTV) nhưng còn lịch sử."""
+
+    def __init__(self, user_id: str):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+
+    @ui.button(label="🗑️ Xóa lịch sử live", style=discord.ButtonStyle.danger)
+    async def delete_history(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(DeleteHistoryModal(self.user_id))
 
 
 # =========================================================

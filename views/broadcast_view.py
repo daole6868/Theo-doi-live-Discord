@@ -157,40 +157,23 @@ class EditBroadcastVolumeModal(ui.Modal, title="Chỉnh Âm Lượng Phát"):
 # =========================================================
 #  SELECT: Chọn kênh voice
 # =========================================================
-class BroadcastChannelSelect(ui.Select):
+class BroadcastChannelSelect(ui.ChannelSelect):
+    """Chọn kênh voice để phát (gõ để tìm, mọi kênh voice trong server)."""
+
     def __init__(self, state: BroadcastState, view: "BroadcastView"):
         self.state = state
         self.view_ref = view
-
-        channels = db.load("channels")
-        options: list[discord.SelectOption] = []
-        if not channels:
-            options.append(discord.SelectOption(label="Chưa có kênh nào", value="none"))
-        else:
-            for cid, data in channels.items():
-                options.append(discord.SelectOption(
-                    label=data.get("name", f"Kênh {cid}"),
-                    value=cid,
-                    description=f"ID: {cid}",
-                ))
-        options = options[:25]
-
         super().__init__(
-            placeholder="🎯 Chọn kênh voice để phát...",
+            placeholder="🎯 Gõ tên kênh voice để phát...",
+            channel_types=[discord.ChannelType.voice],
             min_values=1,
             max_values=1,
-            options=options,
             row=2,
         )
 
     async def callback(self, interaction: discord.Interaction):
-        cid = self.values[0]
-        if cid == "none":
-            await interaction.response.send_message("Chưa có kênh nào trong hệ thống.", ephemeral=True)
-            return
-
-        self.state.channel_id = int(cid)
-        log.info(f"Admin {interaction.user} chọn kênh broadcast = {cid}")
+        self.state.channel_id = self.values[0].id
+        log.info(f"Admin {interaction.user} chọn kênh broadcast = {self.state.channel_id}")
 
         try:
             await interaction.response.edit_message(

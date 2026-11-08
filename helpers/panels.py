@@ -26,6 +26,10 @@ from helpers.embeds import get_custom_embed
 log = logging.getLogger(__name__)
 
 
+# Tăng số này khi cấu trúc panel thay đổi → bot tự gửi lại panel 1 lần khi khởi động
+# (v2: Check CTV dùng ô chọn thành viên, panel khách chia nhiều menu)
+PANEL_VERSION = "2"
+
 # Panel name → channel_id từ .env
 PANEL_CHANNELS = {
     "admin":     ADMIN_CHANNEL_ID,
@@ -129,3 +133,14 @@ async def refresh_panel(bot, panel_name: str) -> bool:
     await db.aupdate("panel_messages", _save)
     log.info(f"✅ Refresh panel '{panel_name}' → msg {new_msg.id} @ #{channel.name}")
     return True
+
+
+async def resync_tracking(bot, reason: str) -> None:
+    """Danh sách CTV vừa đổi → đối chiếu lại bộ tính giờ ngay (không chờ 5 phút)."""
+    cog = bot.get_cog("LiveTrackerCog")
+    if cog is None:
+        return
+    try:
+        await cog.sync_all(reason)
+    except Exception:
+        log.exception("Đối chiếu bộ tính giờ lỗi")

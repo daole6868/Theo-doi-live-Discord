@@ -8,9 +8,9 @@ THÊM KÊNH:
 4. Bot tạo/thêm theo chế độ -> auto-refresh user panel
 
 THÊM CTV (ephemeral tại kênh admin):
-1. Admin bấm "Thêm CTV" -> dropdown chọn kênh
-2. Chọn kênh -> nút "Nhập ID CTV"
-3. Modal nhập user_id -> add CTV (chỉ gán role nếu kênh Riêng tư)
+1. Admin bấm "Thêm CTV" -> ô chọn kênh (gõ để tìm)
+2. Chọn kênh -> ô chọn thành viên (gõ tên để tìm)
+3. Chọn thành viên -> add CTV (chỉ gán role nếu kênh Riêng tư)
 """
 import logging
 
@@ -19,7 +19,8 @@ from discord import ui
 
 from config import TARGET_CATEGORY_ID
 from core.data_manager import db
-from helpers.panels import refresh_panel
+from helpers.panels import refresh_panel, resync_tracking
+from helpers.permissions import deny_if_not_admin
 
 log = logging.getLogger(__name__)
 
@@ -297,144 +298,123 @@ class AddChannelChoiceView(ui.View):
 
 # =========================================================
 #  FLOW THÊM CTV
+#  Bước 1: chọn kênh (ô chọn kênh của Discord — gõ để tìm, không giới hạn 25)
+#  Bước 2: chọn thành viên (ô chọn thành viên của Discord — gõ tên để tìm)
 # =========================================================
-class AddCTVSimpleModal(ui.Modal):
-    def __init__(self, channel_id: str, channel_name: str):
-        super().__init__(title=f"Thêm CTV: {channel_name[:35]}")
+async def add_ctv_to_channel(
+    interaction: discord.Interaction,
+    channel_id: str,
+    member: discord.Member,
+) -> None:
+    """Thêm `member` làm CTV của kênh `channel_id` (interaction đã defer)."""
+    channels_data = db.load("channels")
+    if channel_id not in channels_data:
+        await interaction.followup.send("⚠️ Kênh không tồn tại. Có thể đã bị xóa.", ephemeral=True)
+        return
+    if member.bot:
+        await interaction.followup.send("⚠️ Không thể thêm bot làm CTV.", ephemeral=True)
+        return
+
+    user_id = str(member.id)
+    ctv_data = db.load("ctv")
+    if user_id in ctv_data and channel_id in ctv_data[user_id]:
+        await interaction.followup.send("⚠️ Người này đã là CTV kênh này rồi.", ephemeral=True)
+        return
+
+    # Chỉ gán role nếu kênh Riêng tư (role_id > 0)
+    guild = interaction.guild
+    role_id = channels_data[channel_id].get("role_id", 0)
+    role_added = False
+    if role_id:
+        role = guild.get_role(role_id)
+        if not role:
+            await interaction.followup.send(
+                f"⚠️ Không tìm thấy Role ID {role_id}. Role kênh có thể đã bị xóa.",
+                ephemeral=True,
+            )
+            return
+        try:
+            await member.add_roles(role)
+            role_added = True
+        except discord.Forbidden:
+            await interaction.followup.send("⚠️ Bot không đủ quyền set Role.", ephemeral=True)
+            return
+
+    def _save(data):
+        data.setdefault(user_id, [])
+        if channel_id not in data[user_id]:
+            data[user_id].append(channel_id)
+
+    await db.aupdate("ctv", _save)
+    await refresh_panel(interaction.client, "check_ctv")
+    await resync_tracking(interaction.client, "thêm CTV")
+
+    c_name = channels_data[channel_id].get("name", "?")
+    role_text = "\n✓ Đã gán Role kênh" if role_added else "\n*(Kênh công khai, không cần Role)*"
+    await interaction.followup.send(
+        f"✅ Đã thêm CTV {member.mention} (**{member.display_name}**) tại kênh **{c_name}**.{role_text}",
+        ephemeral=True,
+    )
+    log.info(f"Admin {interaction.user} thêm CTV {user_id} vào kênh {channel_id} (role_added={role_added})")
+
+
+class AddCTVMemberSelect(ui.UserSelect):
+    """Bước 2: chọn thành viên làm CTV."""
+
+    def __init__(self, channel_id: str):
+        super().__init__(placeholder="Gõ tên thành viên để chọn làm CTV...", min_values=1, max_values=1)
         self.channel_id = channel_id
 
-        self.user_input = ui.TextInput(
-            label=f"ID CTV cho kênh {channel_name[:30]}",
-            placeholder="Copy User ID (bật Developer Mode)...",
-            max_length=25,
-            required=True,
-        )
-        self.add_item(self.user_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
+    async def callback(self, interaction: discord.Interaction):
+        if await deny_if_not_admin(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
-
-        user_id = self.user_input.value.strip().replace("<@", "").replace(">", "").replace("!", "")
-        if not user_id.isdigit():
-            await interaction.followup.send("⚠️ ID phải là số.", ephemeral=True)
+        member = self.values[0]
+        if not isinstance(member, discord.Member):
+            member = interaction.guild.get_member(member.id)
+        if member is None:
+            await interaction.followup.send("⚠️ Không tìm thấy thành viên này trong server.", ephemeral=True)
             return
-
-        channels_data = db.load("channels")
-        if self.channel_id not in channels_data:
-            await interaction.followup.send("⚠️ Kênh không tồn tại. Có thể đã bị xóa.", ephemeral=True)
-            return
-
-        guild = interaction.guild
-        member = guild.get_member(int(user_id))
-        if not member:
-            await interaction.followup.send("⚠️ Không tìm thấy user này trong server.", ephemeral=True)
-            return
-
-        ctv_data = db.load("ctv")
-        if user_id in ctv_data and self.channel_id in ctv_data[user_id]:
-            await interaction.followup.send("⚠️ User này đã là CTV kênh này rồi.", ephemeral=True)
-            return
-
-        # Chỉ gán role nếu kênh Riêng tư (role_id > 0)
-        role_id = channels_data[self.channel_id].get("role_id", 0)
-        role_added = False
-        if role_id:
-            role = guild.get_role(role_id)
-            if not role:
-                await interaction.followup.send(
-                    f"⚠️ Không tìm thấy Role ID {role_id}. Role kênh có thể đã bị xóa.",
-                    ephemeral=True,
-                )
-                return
-            try:
-                await member.add_roles(role)
-                role_added = True
-            except discord.Forbidden:
-                await interaction.followup.send("⚠️ Bot không đủ quyền set Role.", ephemeral=True)
-                return
-
-        def _save(data):
-            data.setdefault(user_id, [])
-            if self.channel_id not in data[user_id]:
-                data[user_id].append(self.channel_id)
-
-        await db.aupdate("ctv", _save)
-        await refresh_panel(interaction.client, "check_ctv")
-
-        c_name = channels_data[self.channel_id].get("name", "?")
-        role_text = "\n✓ Đã gán Role kênh" if role_added else "\n*(Kênh công khai, không cần Role)*"
-        await interaction.followup.send(
-            f"✅ Đã thêm CTV <@{user_id}> tại kênh **{c_name}**.{role_text}\n"
-            "🔄 Check CTV panel đã cập nhật.",
-            ephemeral=True,
-        )
-        log.info(f"Admin {interaction.user} thêm CTV {user_id} vào kênh {self.channel_id} (role_added={role_added})")
+        await add_ctv_to_channel(interaction, self.channel_id, member)
 
 
 class AddCTVForChannelView(ui.View):
-    """Bước 2: nút mở modal nhập user_id."""
-
     def __init__(self, channel_id: str):
         super().__init__(timeout=300)
-        self.channel_id = channel_id
-
-        btn = ui.Button(label="➕ Nhập ID CTV", style=discord.ButtonStyle.green)
-        btn.callback = self._open_modal
-        self.add_item(btn)
-
-    async def _open_modal(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("⛔ Chỉ Admin mới được thêm CTV.", ephemeral=True)
-            return
-        channel_name = db.load("channels").get(self.channel_id, {}).get("name", "?")
-        await interaction.response.send_modal(AddCTVSimpleModal(self.channel_id, channel_name))
+        self.add_item(AddCTVMemberSelect(channel_id))
 
 
-class AddCTVChannelSelect(ui.Select):
-    """Bước 1: dropdown chọn kênh."""
+class AddCTVChannelSelect(ui.ChannelSelect):
+    """Bước 1: chọn kênh (chỉ kênh đã thêm vào hệ thống)."""
 
     def __init__(self):
-        channels = db.load("channels")
-        options: list[discord.SelectOption] = []
-        if not channels:
-            options.append(discord.SelectOption(label="Chưa có kênh nào", value="none"))
-        else:
-            for cid, data in channels.items():
-                is_public = not data.get("role_id", 0)
-                options.append(discord.SelectOption(
-                    label=data.get("name", f"Kênh {cid}")[:100],
-                    value=cid,
-                    description="🌐 Công khai" if is_public else "🔒 Riêng tư",
-                ))
         super().__init__(
-            placeholder="Chọn kênh để thêm CTV...",
+            placeholder="Gõ tên kênh voice để thêm CTV...",
+            channel_types=[discord.ChannelType.voice],
             min_values=1,
             max_values=1,
-            options=options[:25],
         )
 
     async def callback(self, interaction: discord.Interaction):
-        cid_str = self.values[0]
-        if cid_str == "none":
-            await interaction.response.send_message("⚠️ Chưa có kênh nào. Hãy Thêm Kênh trước!", ephemeral=True)
+        cid_str = str(self.values[0].id)
+        channels = db.load("channels")
+        if cid_str not in channels:
+            await interaction.response.send_message(
+                "⚠️ Kênh này chưa có trong hệ thống. Hãy **➕ Thêm Kênh** trước.",
+                ephemeral=True,
+            )
             return
 
-        channel_name = db.load("channels").get(cid_str, {}).get("name", "?")
+        channel_name = channels[cid_str].get("name", "?")
         embed = discord.Embed(
             title=f"➕ Thêm CTV cho kênh {channel_name}",
             description=(
-                f"**Bước 2/2:** Nhập ID CTV cho kênh **{channel_name}**\n\n"
-                "Bấm nút bên dưới để mở form nhập User ID."
+                f"**Bước 2/2:** Chọn thành viên làm CTV kênh **{channel_name}**.\n"
+                "Gõ tên vào ô bên dưới để tìm."
             ),
             color=discord.Color.green(),
         )
-        view = AddCTVForChannelView(cid_str)
-        try:
-            await interaction.response.edit_message(embed=embed, view=view)
-        except Exception:
-            log.exception("Edit ephemeral lỗi, fallback send_message")
-            if not interaction.response.is_done():
-                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.response.edit_message(embed=embed, view=AddCTVForChannelView(cid_str))
 
 
 class AddCTVChannelSelectView(ui.View):

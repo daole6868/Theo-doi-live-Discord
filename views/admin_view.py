@@ -13,6 +13,7 @@ import logging
 import discord
 from discord import ui
 
+from helpers.permissions import deny_if_not_admin
 from views.embed_editor import EmbedEditorView, build_preview_embed
 
 log = logging.getLogger(__name__)
@@ -21,6 +22,12 @@ log = logging.getLogger(__name__)
 class AdminPanelView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Chỉ Administrator hoặc role quản lý (ADMIN_ROLE_ID) mới bấm được."""
+        if await deny_if_not_admin(interaction):
+            return False
+        return True
 
     # =====================================================
     #  ROW 0: THÊM
@@ -37,9 +44,8 @@ class AdminPanelView(ui.View):
         embed = discord.Embed(
             title="➕ Thêm CTV",
             description=(
-                "**Bước 1/3:** Chọn kênh mà bạn muốn thêm CTV.\n\n"
-                "Sau khi chọn, Bot sẽ gửi tin nhắn vào text chat của kênh đó "
-                "kèm nút **Nhập ID CTV** để bạn hoàn tất."
+                "**Bước 1/2:** Chọn kênh mà bạn muốn thêm CTV (gõ tên để tìm).\n\n"
+                "Sau đó chọn thành viên làm CTV."
             ),
             color=discord.Color.green(),
         )

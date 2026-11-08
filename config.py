@@ -52,6 +52,9 @@ LEADERBOARD_CHANNEL_ID = _env_int("LEADERBOARD_CHANNEL_ID")
 LATE_ALERT_CHANNEL_ID = _env_int("LATE_ALERT_CHANNEL_ID")
 CHECK_CTV_CHANNEL_ID = _env_int("CHECK_CTV_CHANNEL_ID")
 
+# Role được dùng Admin Dashboard (ngoài người có quyền Administrator). 0 = chỉ Administrator.
+ADMIN_ROLE_ID = _env_int("ADMIN_ROLE_ID")
+
 
 def is_main_guild(guild) -> bool:
     """True nếu `guild` (object hoặc id) là server bot quản lý.

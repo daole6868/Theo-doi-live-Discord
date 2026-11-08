@@ -2,6 +2,7 @@
 Background Tasks:
 
 1. daily_leaderboard (00:05 VN) — gửi BXH ngày hôm qua vào LEADERBOARD_CHANNEL.
+   Bot offline lúc 00:05 → khi bật lại sẽ gửi bù BXH của ngày gần nhất còn thiếu.
 2. check_reminders (mỗi phút) — quét next_live, gửi báo thức, alert admin nếu CTV trễ.
 
 Đã bỏ:
@@ -10,6 +11,7 @@ Background Tasks:
 
 Tất cả tasks đều wrap try/except để không crash bot khi lỗi.
 """
+import asyncio
 import datetime
 import logging
 
@@ -26,6 +28,7 @@ from config import (
     EMBED_CTV_REMINDER,
 )
 from core.data_manager import db
+from core.session_store import store
 from core.state import state
 from helpers.embeds import get_custom_embed
 from helpers.stats import build_daily_leaderboard_embed
@@ -42,6 +45,7 @@ LEADERBOARD_TIME = datetime.time(hour=0, minute=5, tzinfo=VN_TZ)
 class BackgroundCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._leaderboard_checked = False
         self.daily_leaderboard.start()
         self.check_reminders.start()
 
@@ -54,20 +58,46 @@ class BackgroundCog(commands.Cog):
     # =====================================================
     @tasks.loop(time=LEADERBOARD_TIME)
     async def daily_leaderboard(self):
+        await self._send_leaderboard_if_due("00:05")
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if self._leaderboard_checked:
+            return
+        self._leaderboard_checked = True
+        # Chờ bộ tính giờ chốt xong các phiên cũ để BXH gửi bù được chính xác
+        tracker = self.bot.get_cog("LiveTrackerCog")
+        for _ in range(30):
+            if tracker is None or getattr(tracker, "_started", True):
+                break
+            await asyncio.sleep(1)
+        await self._send_leaderboard_if_due("gửi bù khi khởi động")
+
+    async def _send_leaderboard_if_due(self, reason: str) -> None:
+        """Gửi BXH của ngày gần nhất đã kết thúc nếu chưa gửi (ghi nhớ trong meta)."""
         try:
-            log.info("[TASK] daily_leaderboard bắt đầu")
+            now = now_vn()
+            today_send_at = datetime.datetime.combine(now.date(), LEADERBOARD_TIME)
+            due_day = now.date() - datetime.timedelta(days=1 if now >= today_send_at else 2)
+
+            last_raw = store.get_meta("leaderboard_last_day")
+            if last_raw is None:
+                # Lần đầu chạy bản mới: bản cũ đã tự gửi → chỉ ghi nhớ, không gửi trùng
+                store.set_meta("leaderboard_last_day", due_day.isoformat())
+                return
+            if datetime.date.fromisoformat(last_raw) >= due_day:
+                return
+
             channel = self.bot.get_channel(LEADERBOARD_CHANNEL_ID)
             if not channel:
                 log.warning(f"LEADERBOARD_CHANNEL_ID={LEADERBOARD_CHANNEL_ID} không tìm thấy")
                 return
 
-            yesterday = (now_vn() - datetime.timedelta(days=1)).date()
-            embed = build_daily_leaderboard_embed(yesterday)
-
-            await channel.send(embed=embed)
-            log.info(f"Đã gửi BXH CTV ngày {yesterday}")
+            await channel.send(embed=build_daily_leaderboard_embed(due_day))
+            store.set_meta("leaderboard_last_day", due_day.isoformat())
+            log.info(f"Đã gửi BXH CTV ngày {due_day} ({reason})")
         except Exception:
-            log.exception("[TASK] daily_leaderboard lỗi")
+            log.exception("[TASK] gửi BXH lỗi")
 
     @daily_leaderboard.before_loop
     async def _wait_leaderboard(self):
