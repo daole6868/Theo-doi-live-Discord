@@ -4,9 +4,12 @@ Migration script — chạy 1 lần khi bot khởi động.
 Xử lý các thay đổi data structure giữa các version của bot.
 Idempotent — chạy nhiều lần không sao.
 """
+import json
 import logging
 
+from config import KIND_STREAM, LEGACY_SESSIONS_JSON
 from core.data_manager import db
+from core.session_store import store
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +71,55 @@ def migrate_voice_settings():
         db.save("voice_settings", settings)
 
 
+def migrate_sessions_to_sqlite():
+    """
+    Chuyển lịch sử phiên từ `data_sessions.json` (key theo kênh) sang SQLite.
+
+    Chạy 1 lần: đánh dấu trong bảng meta và đổi tên file JSON thành `.migrated`
+    (giữ lại để đối chiếu nếu cần).
+    """
+    if store.get_meta("migrated_sessions_json") == "1":
+        return
+    path = LEGACY_SESSIONS_JSON
+    if not path.exists():
+        store.set_meta("migrated_sessions_json", "1")
+        return
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except json.JSONDecodeError as e:
+        log.error(f"data_sessions.json lỗi định dạng ({e}) — bỏ qua migrate, giữ nguyên file")
+        return
+
+    imported = skipped = 0
+    for cid, lst in (data.items() if isinstance(data, dict) else []):
+        if not isinstance(lst, list):
+            continue
+        for s in lst:
+            if not isinstance(s, dict):
+                continue
+            uid = str(s.get("user_id", "")).strip()
+            ts_start = s.get("start_time", s.get("start"))
+            ts_end = s.get("end_time", s.get("end"))
+            if not uid or not ts_start or not ts_end:
+                skipped += 1  # Phiên rất cũ không có user_id → không biết của ai
+                continue
+            saved = store.add_session(
+                uid, str(cid), KIND_STREAM, float(ts_start), float(ts_end), min_seconds=0,
+            )
+            if saved:
+                imported += 1
+            else:
+                skipped += 1
+
+    store.set_meta("migrated_sessions_json", "1")
+    try:
+        path.rename(path.with_name(path.name + ".migrated"))
+    except OSError:
+        log.exception("Đổi tên data_sessions.json lỗi (dữ liệu đã chuyển xong)")
+    log.info(f"✓ Migrate: chuyển {imported} phiên sang SQLite (bỏ qua {skipped})")
+
+
 def run_all_migrations():
     """Gọi trong setup_hook của main.py."""
     log.info("=" * 40)
@@ -80,5 +132,9 @@ def run_all_migrations():
         migrate_voice_settings()
     except Exception:
         log.exception("migrate_voice_settings lỗi")
+    try:
+        migrate_sessions_to_sqlite()
+    except Exception:
+        log.exception("migrate_sessions_to_sqlite lỗi")
     log.info("Migrations xong.")
     log.info("=" * 40)

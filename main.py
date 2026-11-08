@@ -11,6 +11,7 @@ from discord.ext import commands
 from config import TOKEN
 from core.logger import setup_logging
 from helpers.migration import run_all_migrations
+from helpers.stats import set_channel_name_resolver
 from views.admin_view import AdminPanelView
 from views.user_view import UserSelectView
 from views.check_ctv_view import CheckCTVPanelView
@@ -38,6 +39,9 @@ class GachazBot(commands.Bot):
 
         # 0. Migrations (chạy trước mọi thứ khác)
         run_all_migrations()
+
+        # Báo cáo lấy tên kênh từ Discord cho kênh chưa lưu trong hệ thống
+        set_channel_name_resolver(self._resolve_channel_name)
 
         # 1. Persistent views
         self.add_view(AdminPanelView())
@@ -68,6 +72,24 @@ class GachazBot(commands.Bot):
 
         log.info("SETUP HOOK xong.")
         log.info("=" * 60)
+
+    def _resolve_channel_name(self, channel_id: str) -> str | None:
+        try:
+            ch = self.get_channel(int(channel_id))
+        except (TypeError, ValueError):
+            return None
+        return getattr(ch, "name", None)
+
+    async def close(self) -> None:
+        # Tắt bot có kiểm soát (restart/stop) → ghi nhịp tim lần cuối để
+        # lần khởi động sau chốt các phiên đúng thời điểm bot dừng.
+        tracker = self.get_cog("LiveTrackerCog")
+        if tracker is not None:
+            try:
+                tracker.write_final_heartbeat()
+            except Exception:
+                log.exception("Ghi nhịp tim cuối lỗi")
+        await super().close()
 
 
 bot = GachazBot(command_prefix="!", intents=intents, help_command=None)

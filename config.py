@@ -17,8 +17,9 @@ load_dotenv()
 #  BASE PATHS
 # =========================================================
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-LOG_DIR = BASE_DIR / "logs"
+# Cho phép đổi thư mục qua biến môi trường (dùng khi chạy test)
+DATA_DIR = Path(os.getenv("GACHAZ_DATA_DIR", BASE_DIR / "data"))
+LOG_DIR = Path(os.getenv("GACHAZ_LOG_DIR", BASE_DIR / "logs"))
 
 DATA_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
@@ -52,6 +53,20 @@ LATE_ALERT_CHANNEL_ID = _env_int("LATE_ALERT_CHANNEL_ID")
 CHECK_CTV_CHANNEL_ID = _env_int("CHECK_CTV_CHANNEL_ID")
 
 
+def is_main_guild(guild) -> bool:
+    """True nếu `guild` (object hoặc id) là server bot quản lý.
+
+    GUILD_ID = 0 → không lọc (chấp nhận mọi server).
+    """
+    if not GUILD_ID:
+        return True
+    gid = getattr(guild, "id", guild)
+    try:
+        return gid is not None and int(gid) == GUILD_ID
+    except (TypeError, ValueError):
+        return False
+
+
 # =========================================================
 #  TIME
 # =========================================================
@@ -65,7 +80,6 @@ DATA_FILES = {
     "channels":       DATA_DIR / "data_channels.json",
     "ctv":            DATA_DIR / "data_ctv.json",
     "subscribers":    DATA_DIR / "data_subs.json",
-    "sessions":       DATA_DIR / "data_sessions.json",
     "embeds":         DATA_DIR / "data_embeds.json",
     "next_live":      DATA_DIR / "data_next_live.json",
     "live_state":     DATA_DIR / "data_live_state.json",
@@ -74,14 +88,27 @@ DATA_FILES = {
     "voice_alerts":   DATA_DIR / "data_voice_alerts.json",    # state CTV đang thoại chưa live (batch 5)
 }
 
+# Lịch sử phiên (live + audio) lưu trong SQLite — giữ vĩnh viễn.
+# File JSON cũ `data_sessions.json` được chuyển sang đây tự động ở lần chạy đầu.
+SESSIONS_DB_FILE = DATA_DIR / "sessions.db"
+LEGACY_SESSIONS_JSON = DATA_DIR / "data_sessions.json"
+
 
 # =========================================================
 #  BUSINESS RULES
 # =========================================================
 LATE_REMINDER_MAX = 6
 REMINDER_INTERVAL_MINUTES = 5
-SESSION_RETENTION_DAYS = 15
 MIN_SESSION_SECONDS = 5
+
+# Bộ tính giờ
+HEARTBEAT_SECONDS = 30            # Bot ghi "vẫn đang chạy" mỗi 30 giây
+RECONCILE_MINUTES = 5             # Định kỳ đối chiếu trạng thái với Discord
+LEGACY_LIVE_MAX_HOURS = 24        # Lần đầu nâng cấp: chỉ giữ phiên cũ nếu bắt đầu < 24h trước
+
+# Loại phiên
+KIND_STREAM = "stream"            # Bật Go Live (chia sẻ màn hình) — chỉ loại này tính là LIVE
+KIND_AUDIO = "audio"              # Ở trong kênh voice nhưng không chia sẻ màn hình
 
 DELAY_OPTIONS = [
     ("Hoãn 5 phút",   5 * 60),

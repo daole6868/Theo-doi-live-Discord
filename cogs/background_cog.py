@@ -1,10 +1,12 @@
 """
-4 Background Tasks:
+Background Tasks:
 
-1. midnight_cutoff (00:00 VN) — cắt session vắt qua ngày, ghi phần hôm qua vào history.
-2. daily_leaderboard (00:05 VN) — gửi BXH ngày hôm qua vào LEADERBOARD_CHANNEL.
-3. cleanup_old_sessions (02:00 VN) — xóa session cũ hơn SESSION_RETENTION_DAYS ngày.
-4. check_reminders (mỗi phút) — quét next_live, gửi báo thức, alert admin nếu CTV trễ.
+1. daily_leaderboard (00:05 VN) — gửi BXH ngày hôm qua vào LEADERBOARD_CHANNEL.
+2. check_reminders (mỗi phút) — quét next_live, gửi báo thức, alert admin nếu CTV trễ.
+
+Đã bỏ:
+- midnight_cutoff: phiên vắt qua đêm giờ được cắt theo ngày ngay lúc lưu (core/session_store.py).
+- cleanup_old_sessions: lịch sử được giữ vĩnh viễn trong SQLite.
 
 Tất cả tasks đều wrap try/except để không crash bot khi lỗi.
 """
@@ -19,87 +21,36 @@ from config import (
     GUILD_ID,
     LEADERBOARD_CHANNEL_ID,
     LATE_ALERT_CHANNEL_ID,
-    SESSION_RETENTION_DAYS,
     LATE_REMINDER_MAX,
     REMINDER_INTERVAL_MINUTES,
-    MIN_SESSION_SECONDS,
     EMBED_CTV_REMINDER,
 )
 from core.data_manager import db
 from core.state import state
 from helpers.embeds import get_custom_embed
-from helpers.stats import build_leaderboard, build_daily_leaderboard_embed
-from helpers.time_utils import now_vn, fmt_dur, start_of_day_vn
+from helpers.stats import build_daily_leaderboard_embed
+from helpers.time_utils import now_vn
 from views.notify_view import ReminderView
 
 log = logging.getLogger(__name__)
 
 
 # ============ SCHEDULED TIMES (giờ VN) ============
-MIDNIGHT_TIME = datetime.time(hour=0, minute=0, tzinfo=VN_TZ)
 LEADERBOARD_TIME = datetime.time(hour=0, minute=5, tzinfo=VN_TZ)
-CLEANUP_TIME = datetime.time(hour=2, minute=0, tzinfo=VN_TZ)
 
 
 class BackgroundCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.midnight_cutoff.start()
         self.daily_leaderboard.start()
-        self.cleanup_old_sessions.start()
         self.check_reminders.start()
 
     def cog_unload(self):
-        self.midnight_cutoff.cancel()
         self.daily_leaderboard.cancel()
-        self.cleanup_old_sessions.cancel()
         self.check_reminders.cancel()
 
     # =====================================================
-    #  TASK 1: MIDNIGHT CUTOFF (00:00)
-    # =====================================================
-    @tasks.loop(time=MIDNIGHT_TIME)
-    async def midnight_cutoff(self):
-        try:
-            log.info("[TASK] midnight_cutoff bắt đầu")
-            now = now_vn()
-            cutoff = start_of_day_vn(now)  # 00:00 hôm nay
-
-            for cid_str in state.snapshot().keys():
-                start_dt = state.get_start(cid_str)
-                user_id = state.get_user(cid_str) or ""
-                if start_dt is None:
-                    continue
-
-                if start_dt < cutoff:
-                    duration = (cutoff - start_dt).total_seconds()
-                    if duration >= MIN_SESSION_SECONDS:
-                        # Capture theo default args để tránh closure bug
-                        def _save(sessions, cid=cid_str, s=start_dt, e=cutoff,
-                                  d=duration, u=user_id):
-                            sessions.setdefault(cid, []).append({
-                                "start_time": s.timestamp(),
-                                "end_time": e.timestamp(),
-                                "duration": int(d),
-                                "user_id": str(u),
-                            })
-                        await db.aupdate("sessions", _save)
-
-                    # Reset mốc bắt đầu về 00:00 để tính tiếp cho hôm nay
-                    state.reset_start(cid_str, cutoff)
-                    log.info(
-                        f"Cắt session kênh {cid_str} tại 00:00, "
-                        f"{int(duration)}s ghi cho hôm qua"
-                    )
-        except Exception:
-            log.exception("[TASK] midnight_cutoff lỗi")
-
-    @midnight_cutoff.before_loop
-    async def _wait_midnight(self):
-        await self.bot.wait_until_ready()
-
-    # =====================================================
-    #  TASK 2: DAILY LEADERBOARD (00:05) — BXH theo CTV
+    #  TASK 1: DAILY LEADERBOARD (00:05) — BXH theo CTV
     # =====================================================
     @tasks.loop(time=LEADERBOARD_TIME)
     async def daily_leaderboard(self):
@@ -123,41 +74,7 @@ class BackgroundCog(commands.Cog):
         await self.bot.wait_until_ready()
 
     # =====================================================
-    #  TASK 3: CLEANUP OLD SESSIONS (02:00)
-    # =====================================================
-    @tasks.loop(time=CLEANUP_TIME)
-    async def cleanup_old_sessions(self):
-        try:
-            log.info("[TASK] cleanup_old_sessions bắt đầu")
-            cutoff = now_vn() - datetime.timedelta(days=SESSION_RETENTION_DAYS)
-            cutoff_ts = cutoff.timestamp()
-            removed_total = 0
-
-            def _save(sessions):
-                nonlocal removed_total
-                for cid, lst in list(sessions.items()):
-                    if not isinstance(lst, list):
-                        continue
-                    kept = []
-                    for s in lst:
-                        ts = s.get("start_time", s.get("start"))
-                        if ts and float(ts) >= cutoff_ts:
-                            kept.append(s)
-                        else:
-                            removed_total += 1
-                    sessions[cid] = kept
-
-            await db.aupdate("sessions", _save)
-            log.info(f"Cleanup xóa {removed_total} session cũ > {SESSION_RETENTION_DAYS} ngày")
-        except Exception:
-            log.exception("[TASK] cleanup_old_sessions lỗi")
-
-    @cleanup_old_sessions.before_loop
-    async def _wait_cleanup(self):
-        await self.bot.wait_until_ready()
-
-    # =====================================================
-    #  TASK 4: CHECK REMINDERS (mỗi phút)
+    #  TASK 2: CHECK REMINDERS (mỗi phút)
     # =====================================================
     @tasks.loop(minutes=1)
     async def check_reminders(self):
@@ -175,7 +92,7 @@ class BackgroundCog(commands.Cog):
                     continue
 
                 # Đã live → không cần nhắc nữa
-                if state.is_live(cid_str):
+                if state.channel_has_stream(cid_str):
                     to_delete.append(cid_str)
                     continue
 

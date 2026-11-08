@@ -53,3 +53,29 @@ def start_of_day_vn(dt: datetime.datetime | None = None) -> datetime.datetime:
         d = d.replace(tzinfo=VN_TZ)
     d = d.astimezone(VN_TZ)
     return d.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def day_bounds_ts(day: datetime.date) -> tuple[float, float]:
+    """(00:00, 24:00) của 1 ngày giờ VN dưới dạng timestamp."""
+    start = datetime.datetime.combine(day, datetime.time(0, 0), tzinfo=VN_TZ)
+    end = start + datetime.timedelta(days=1)
+    return start.timestamp(), end.timestamp()
+
+
+def split_by_day(start_ts: float, end_ts: float) -> list[tuple[float, float, datetime.date]]:
+    """
+    Cắt khoảng [start_ts, end_ts) tại các mốc 00:00 giờ VN.
+
+    Ví dụ 23:00 → 01:00 trả về 2 đoạn: (23:00, 24:00, hôm qua) và (00:00, 01:00, hôm nay).
+    """
+    pieces: list[tuple[float, float, datetime.date]] = []
+    if end_ts <= start_ts:
+        return pieces
+    cur = start_ts
+    while cur < end_ts:
+        day = from_ts(cur).date()
+        _, day_end = day_bounds_ts(day)
+        piece_end = min(end_ts, day_end)
+        pieces.append((cur, piece_end, day))
+        cur = piece_end
+    return pieces

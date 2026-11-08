@@ -86,7 +86,7 @@ class VoiceAlertCog(commands.Cog):
                 continue
 
             # Kênh có ai đang live không? (Option D)
-            if state.is_live(channel_id):
+            if state.channel_has_stream(channel_id):
                 to_remove.append(uid)
                 log.info(f"[sync] Remove {uid}: kênh {channel_id} đã có người live")
                 continue
@@ -134,7 +134,7 @@ class VoiceAlertCog(commands.Cog):
                 continue
 
             # Nếu kênh này đã có người live → không track ai vào kênh này (Option D)
-            if state.is_live(cid_str):
+            if state.channel_has_stream(cid_str):
                 continue
 
             for member in channel.members:
@@ -206,9 +206,9 @@ class VoiceAlertCog(commands.Cog):
         # 1. Đang trong voice
         # 2. Không stream
         # 3. Kênh bot quản lý (managed)
-        # 4. Kênh chưa có ai đang live (state.is_live = False)
+        # 4. Kênh chưa có ai đang live (state.channel_has_stream = False)
         # → KHÔNG check "kênh mình quản" — mọi CTV trong kênh chưa live đều bị nhắc
-        channel_is_live = state.is_live(cid_str) if cid_str else False
+        channel_is_live = state.channel_has_stream(cid_str) if cid_str else False
 
         should_track = (
             in_voice
@@ -307,7 +307,7 @@ class VoiceAlertCog(commands.Cog):
                     continue
 
                 # Option C: nếu giữa chừng có ai bật live trong kênh này → hủy tracking
-                if state.is_live(channel_id):
+                if state.channel_has_stream(channel_id):
                     log.info(
                         f"[tick] user={uid}: kênh {channel_id} vừa có người live "
                         f"→ hủy tracking (CTV này chỉ đang xem)"

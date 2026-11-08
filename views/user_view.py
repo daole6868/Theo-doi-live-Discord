@@ -7,7 +7,6 @@ FIX (batch 4A):
   nhưng logic notify đã đổi trong live_tracker_cog: khi CTV Y live ở kênh nào đó,
   bot sẽ notify tất cả subs của các kênh Y quản lý (yêu cầu #3).
 """
-import datetime
 import logging
 
 import discord
@@ -21,7 +20,12 @@ from config import (
 from core.data_manager import db
 from core.state import state
 from helpers.embeds import get_custom_embed
-from helpers.stats import create_channel_report, get_last_session
+from helpers.stats import (
+    channel_name,
+    create_channel_report,
+    get_channel_owners,
+    get_last_stream_session,
+)
 from helpers.time_utils import from_ts, fmt_dur, now_vn
 
 log = logging.getLogger(__name__)
@@ -205,38 +209,25 @@ class UserChannelSelect(ui.Select):
                 log.exception("Thu hồi role kênh khác lỗi")
 
         # ==== [3] XÂY DỰNG TEXT TRẠNG THÁI ====
-        is_live = state.is_live(channel_id)
-        current_streamer_id = state.get_user(channel_id) if is_live else None
-
         # CTV chính (chủ) của kênh này
-        owners = {uid for uid, chans in ctv_data.items() if isinstance(chans, list) and channel_id in chans}
+        owners = set(get_channel_owners(channel_id, ctv_data))
+        live_now = state.streams()  # {user_id: info} — mọi CTV đang LIVE
+        now_check = now_vn()
 
-        # Real live TẠI kênh này = có streamer VÀ streamer là chủ kênh
-        real_live = is_live and str(current_streamer_id) in owners
+        # Chủ kênh đang live TẠI kênh này / ở kênh KHÁC
+        live_here = {uid: i for uid, i in live_now.items() if uid in owners and i["channel_id"] == channel_id}
+        live_elsewhere = {uid: i for uid, i in live_now.items() if uid in owners and i["channel_id"] != channel_id}
+        real_live = bool(live_here)
 
-        # MỚI: Nếu không live TẠI kênh này → tìm CTV chủ đang live ở kênh KHÁC
-        live_elsewhere = []  # list of {cid, user_id, channel_name, start_dt, duration_sec}
-        if not real_live and owners:
-            now_check = now_vn()
-            for cid_other, info in state.snapshot().items():
-                if cid_other == channel_id:
-                    continue
-                streamer_uid = str(info.get("user_id", ""))
-                if streamer_uid in owners:
-                    start_dt = from_ts(info["start_ts"])
-                    duration_sec = (now_check - start_dt).total_seconds()
-                    c_name_other = channels_data.get(cid_other, {}).get(
-                        "name", f"Kênh {cid_other}"
-                    )
-                    live_elsewhere.append({
-                        "cid": cid_other,
-                        "user_id": streamer_uid,
-                        "channel_name": c_name_other,
-                        "start_dt": start_dt,
-                        "duration_sec": duration_sec,
-                    })
+        def _live_line(uid: str, info: dict, show_channel: bool) -> str:
+            start_dt = state.start_dt(info)
+            dur = fmt_dur((now_check - start_dt).total_seconds())
+            where = f" tại **{channel_name(info['channel_id'], channels_data)}**" if show_channel else ""
+            return (
+                f" - <@{uid}>{where}\n"
+                f"   Bắt đầu: `{start_dt.strftime('%H:%M:%S')}` | Đã live: `{dur}`"
+            )
 
-        # Status text
         if real_live:
             status_text = "🔴 ĐANG LIVE (Có Stream)"
         elif live_elsewhere:
@@ -244,44 +235,24 @@ class UserChannelSelect(ui.Select):
         else:
             status_text = "⚫ OFFLINE (Chưa Live)"
 
-        # Section chi tiết
-        if real_live:
-            start = state.get_start(channel_id)
-            now = now_vn()
-            current_duration = fmt_dur((now - start).total_seconds())
-            section_title = "Phiên Live hiện tại:"
-            section_text = (
-                f" - **Đang phát trực tiếp từ:** `{start.strftime('%H:%M:%S')}`\n"
-                f" - **Thời gian đã Live:** `{current_duration}`\n"
-                f" - **CTV:** <@{current_streamer_id}>\n"
-                f" - **Kênh:** {channels_data[channel_id]['name']} (chính là kênh này)"
-            )
-        elif live_elsewhere:
-            section_title = "CTV chủ đang live ở kênh khác:"
-            lines = []
-            for item in live_elsewhere:
-                lines.append(
-                    f" - <@{item['user_id']}> tại **{item['channel_name']}**\n"
-                    f"   Bắt đầu: `{item['start_dt'].strftime('%H:%M:%S')}` "
-                    f"| Đã live: `{fmt_dur(item['duration_sec'])}`"
-                )
+        if real_live or live_elsewhere:
+            lines = [_live_line(uid, i, False) for uid, i in live_here.items()]
+            lines += [_live_line(uid, i, True) for uid, i in live_elsewhere.items()]
+            section_title = "Phiên Live hiện tại:" if real_live else "CTV chủ đang live ở kênh khác:"
             section_text = "\n".join(lines)
         else:
             section_title = "Phiên Live gần nhất:"
-            last = get_last_session(channel_id)
+            last = get_last_stream_session(owners) if owners else None
             section_text = "Chưa có dữ liệu"
             if last:
-                ts_start = last.get("start_time", last.get("start"))
-                ts_end = last.get("end_time", last.get("end"))
-                if ts_start and ts_end:
-                    dt_s = from_ts(ts_start)
-                    dt_e = from_ts(ts_end)
-                    dur = fmt_dur(last.get("duration", 0))
-                    section_text = (
-                        f" - **Ngày:** `{dt_s.strftime('%d/%m/%Y')}`\n"
-                        f" - **Khung giờ:** `{dt_s.strftime('%H:%M')}` đến `{dt_e.strftime('%H:%M')}`\n"
-                        f" - **Tổng thời lượng:** `{dur}`"
-                    )
+                dt_s = from_ts(last["start_ts"])
+                dt_e = from_ts(last["end_ts"])
+                section_text = (
+                    f" - **CTV:** <@{last['user_id']}>\n"
+                    f" - **Ngày:** `{dt_s.strftime('%d/%m/%Y')}`\n"
+                    f" - **Khung giờ:** `{dt_s.strftime('%H:%M')}` đến `{dt_e.strftime('%H:%M')}`\n"
+                    f" - **Thời lượng:** `{fmt_dur(last.get('duration', 0))}`"
+                )
 
         # ==== [4] LỊCH LIVE TIẾP THEO ====
         nl_data = db.load("next_live")
@@ -306,7 +277,7 @@ class UserChannelSelect(ui.Select):
         if real_live:
             live_link_cid = channel_id
         elif live_elsewhere:
-            live_link_cid = live_elsewhere[0]["cid"]
+            live_link_cid = next(iter(live_elsewhere.values()))["channel_id"]
         else:
             live_link_cid = channel_id  # fallback
 

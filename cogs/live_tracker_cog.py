@@ -1,32 +1,37 @@
 """
-Live Tracker Cog — detect LIVE/OFF qua on_voice_state_update.
+Live Tracker Cog — tính giờ LIVE (chia sẻ màn hình) và AUDIO cho từng CTV.
 
-FIX BUG (batch 4A):
-- BUG #1: Non-CTV user live → KHÔNG track, KHÔNG lưu session.
-- BUG #2: Non-CTV user live xong → KHÔNG gửi DM chọn giờ live tiếp theo.
-- BUG #2 (case CTV_Y live vào kênh của CTV_A): VẪN track (lưu session cho user Y),
-  NHƯNG không gửi NextLive DM (vì Y không phải chủ kênh này).
-  Report kênh cũng không cộng thời gian này (đã fix trong stats.py).
-- BUG #3: Notify subscribers — không chỉ subs của kênh đang live, mà iterate qua
-  TẤT CẢ kênh mà CTV đang live quản lý → notify TẤT CẢ subs của những kênh đó.
-  Dedupe để không gửi DM trùng.
+- Mỗi sự kiện voice của 1 CTV → `Tracker.apply()` đưa đoạn đang chạy về đúng trạng thái.
+- Khởi động: chốt các đoạn cũ tại nhịp tim cuối cùng (không tính lúc bot offline),
+  rồi mở đoạn mới cho ai đang ở trong voice.
+- Mất kết nối Discord rồi vào lại: đối chiếu, đoạn nào lệch thì chốt tại lúc mất kết nối.
+- Định kỳ 5 phút: đối chiếu lại để bắt các sự kiện bị lỡ.
+- Nhịp tim mỗi 30 giây.
 """
+import asyncio
 import logging
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from config import (
-    MIN_SESSION_SECONDS,
-    EMBED_LIVE_NOTIF,
     EMBED_CTV_NEXT_LIVE,
+    EMBED_LIVE_NOTIF,
+    HEARTBEAT_SECONDS,
+    KIND_STREAM,
+    LEGACY_LIVE_MAX_HOURS,
+    RECONCILE_MINUTES,
+    is_main_guild,
 )
 from core.data_manager import db
+from core.session_store import store
 from core.state import state
+from core.tracker import Change, Tracker, desired_from_voice
 from helpers.embeds import get_custom_embed
-from helpers.time_utils import now_vn
-from views.notify_view import NotifyView
+from helpers.stats import channel_name
+from helpers.time_utils import fmt_dur, now_ts
 from views.ctv_view import NextLiveView
+from views.notify_view import NotifyView
 
 log = logging.getLogger(__name__)
 
@@ -34,50 +39,102 @@ log = logging.getLogger(__name__)
 class LiveTrackerCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._ready = False
+        self.tracker = Tracker(state, store)
+        self._lock = asyncio.Lock()
+        self._started = False          # đã chạy đối chiếu khởi động chưa
+        self._connected = False
+        self._disconnected_at: float | None = None
+
+    async def cog_load(self):
+        # Đọc state trước khi nhận sự kiện (sự kiện bị bỏ qua cho đến khi đối chiếu xong)
+        state.load_from_disk()
+        self.heartbeat.start()
+        self.periodic_reconcile.start()
+
+    async def cog_unload(self):
+        self.heartbeat.cancel()
+        self.periodic_reconcile.cancel()
 
     # =====================================================
-    #  ON READY
+    #  TRẠNG THÁI THỰC TẾ TỪ DISCORD
+    # =====================================================
+    def collect_desired(self) -> dict[str, tuple[str, str]]:
+        """{user_id: (kind, channel_id)} cho mọi CTV đang ở trong voice."""
+        ctv_data = db.load("ctv")
+        desired: dict[str, tuple[str, str]] = {}
+        for guild in self.bot.guilds:
+            if not is_main_guild(guild):
+                continue
+            for channel in list(guild.voice_channels) + list(guild.stage_channels):
+                for member in channel.members:
+                    if member.bot or str(member.id) not in ctv_data:
+                        continue
+                    d = desired_from_voice(member.voice, guild)
+                    if d:
+                        desired[str(member.id)] = d
+        return desired
+
+    async def sync_all(self, reason: str) -> None:
+        """Đối chiếu toàn bộ (dùng sau khi vào lại / định kỳ / admin đổi danh sách CTV)."""
+        async with self._lock:
+            if not self._started:
+                return
+            changes = self.tracker.reconcile(self.collect_desired(), now_ts())
+        if changes:
+            log.info(f"[sync:{reason}] {len(changes)} thay đổi")
+        await self._handle_changes(changes, from_event=False)
+
+    # =====================================================
+    #  KẾT NỐI
     # =====================================================
     @commands.Cog.listener()
     async def on_ready(self):
-        if self._ready:
-            return
-        self._ready = True
+        async with self._lock:
+            now = now_ts()
+            desired = self.collect_desired()
+            if not self._started:
+                hb_raw = store.get_meta("heartbeat")
+                last_hb = float(hb_raw) if hb_raw else None
+                changes = self.tracker.startup(
+                    desired, now, last_hb, LEGACY_LIVE_MAX_HOURS * 3600,
+                )
+                self._started = True
+                log.info(
+                    f"✅ Bot đã đăng nhập: {self.bot.user} — đối chiếu khởi động: "
+                    f"{len(changes)} thay đổi, {len(state.user_ids())} CTV đang trong voice"
+                )
+            else:
+                changes = self.tracker.reconcile(desired, now, end_ts=self._disconnected_at)
+                log.info(f"🔄 Kết nối lại (ready) — đối chiếu: {len(changes)} thay đổi")
+            self._connected = True
+            self._disconnected_at = None
+            store.set_meta("heartbeat", now)
+        await self._handle_changes(changes, from_event=False)
 
-        log.info(f"✅ Bot đã đăng nhập: {self.bot.user} (id={self.bot.user.id})")
+    @commands.Cog.listener()
+    async def on_resumed(self):
+        async with self._lock:
+            if not self._started:
+                return
+            changes = self.tracker.reconcile(
+                self.collect_desired(), now_ts(), end_ts=self._disconnected_at,
+            )
+            self._connected = True
+            self._disconnected_at = None
+            store.set_meta("heartbeat", now_ts())
+        if changes:
+            log.info(f"🔄 Kết nối lại (resume) — đối chiếu: {len(changes)} thay đổi")
+        await self._handle_changes(changes, from_event=False)
 
-        state.load_from_disk()
-
-        ctv_data = db.load("ctv")
-        detected = 0
-
-        # Scan TẤT CẢ voice channels trong mọi guild bot có mặt
-        # (không chỉ managed — để detect CTV live ở kênh chưa add vào bot)
-        for guild in self.bot.guilds:
-            for channel in guild.voice_channels:
-                for member in channel.members:
-                    if member.bot:
-                        continue
-                    if not (member.voice and member.voice.self_stream):
-                        continue
-                    # Chỉ track CTV
-                    if str(member.id) not in ctv_data:
-                        log.info(f"⏭️ Bỏ qua non-CTV đang live: {member} @ {channel.name}")
-                        continue
-                    cid_str = str(channel.id)
-                    if state.is_live(cid_str):
-                        continue  # Đã track (từ persist)
-                    state.start(cid_str, member.id)
-                    detected += 1
-                    log.info(f"🔴 Detect live sẵn (on_ready): {member} @ {channel.name}")
-                    break  # 1 kênh chỉ track 1 người live
-
-        if detected:
-            log.info(f"Detect {detected} phiên live đang chạy khi khởi động.")
+    @commands.Cog.listener()
+    async def on_disconnect(self):
+        if self._connected:
+            self._connected = False
+            self._disconnected_at = now_ts()
+            log.warning("⚠️ Mất kết nối Discord — tạm dừng tính giờ cho đến khi vào lại")
 
     # =====================================================
-    #  ON VOICE STATE UPDATE
+    #  SỰ KIỆN VOICE
     # =====================================================
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -86,82 +143,99 @@ class LiveTrackerCog(commands.Cog):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ):
-        if member.bot:
+        if member.bot or not self._started or not is_main_guild(member.guild):
             return
 
-        was_streaming = bool(before.channel and before.self_stream)
-        is_streaming = bool(after.channel and after.self_stream)
+        uid = str(member.id)
+        is_ctv = uid in db.load("ctv")
+        if not is_ctv and state.get(uid) is None:
+            return  # Không phải CTV, không có gì để chốt
 
-        # Track live của CTV ở BẤT KỲ kênh voice nào (không chỉ managed)
-        # → Để notify subs khi CTV live ở kênh của người khác hoặc kênh chưa add vào bot
-        # _start_live vẫn tự skip non-CTV bên trong
+        desired = desired_from_voice(after, member.guild) if is_ctv else None
+        async with self._lock:
+            changes = self.tracker.apply(uid, desired, now_ts())
+        await self._handle_changes(changes, from_event=True)
 
-        # Case 1: bắt đầu stream
-        if is_streaming and not was_streaming:
-            await self._start_live(after.channel, member)
+    def write_final_heartbeat(self) -> None:
+        if self._started and self._connected:
+            store.set_meta("heartbeat", now_ts())
 
-        # Case 2: kết thúc stream
-        elif was_streaming and not is_streaming:
-            await self._stop_live(before.channel.id, member.id)
+    # =====================================================
+    #  TÁC VỤ NỀN
+    # =====================================================
+    @tasks.loop(seconds=HEARTBEAT_SECONDS)
+    async def heartbeat(self):
+        if self._started and self._connected:
+            try:
+                store.set_meta("heartbeat", now_ts())
+            except Exception:
+                log.exception("Ghi nhịp tim lỗi")
 
-        # Case 3: chuyển kênh khi đang stream
-        elif was_streaming and is_streaming and before.channel.id != after.channel.id:
-            await self._stop_live(before.channel.id, member.id)
-            await self._start_live(after.channel, member)
-
-    # ---------- HELPERS ----------
-    def _is_managed(self, channel_id) -> bool:
-        return str(channel_id) in db.load("channels")
-
-    async def _start_live(self, channel: discord.VoiceChannel, member: discord.Member):
-        """Bắt đầu 1 phiên live."""
-        cid_str = str(channel.id)
-        user_id_str = str(member.id)
-
-        if state.is_live(cid_str):
+    @tasks.loop(minutes=RECONCILE_MINUTES)
+    async def periodic_reconcile(self):
+        if not (self._started and self._connected):
             return
+        try:
+            await self.sync_all("định kỳ")
+        except Exception:
+            log.exception("Đối chiếu định kỳ lỗi")
 
-        # ===== FIX BUG #1: chỉ track nếu user là CTV (bất kỳ CTV nào) =====
-        ctv_data = db.load("ctv")
-        if user_id_str not in ctv_data:
-            log.info(f"⏭️ Bỏ qua non-CTV live: {member} @ {channel.name}")
+    @heartbeat.before_loop
+    @periodic_reconcile.before_loop
+    async def _wait_ready(self):
+        await self.bot.wait_until_ready()
+
+    # =====================================================
+    #  XỬ LÝ SAU KHI THAY ĐỔI
+    # =====================================================
+    async def _handle_changes(self, changes: list[Change], from_event: bool) -> None:
+        if not changes:
             return
+        # Ai vừa bị chốt stream rồi mở lại stream trong cùng đợt đối chiếu
+        # (vd. đoạn bị cắt do bot restart) → không phải bắt đầu/kết thúc live thật.
+        stopped_streams = {c.user_id for c in changes if c.action == "stop" and c.kind == KIND_STREAM}
+        started_streams = {c.user_id for c in changes if c.action == "start" and c.kind == KIND_STREAM}
 
-        # Track session
-        now = now_vn()
-        state.start(cid_str, member.id, now)
+        for c in changes:
+            name = channel_name(c.channel_id)
+            if c.action == "stop":
+                level = logging.INFO if c.kind == KIND_STREAM else logging.DEBUG
+                log.log(level, f"⚫ STOP {c.kind}: {c.user_id} @ {name}, lưu {fmt_dur(c.saved_seconds)}"
+                               f"{' (ước tính)' if c.flags else ''}")
+                if c.kind == KIND_STREAM and c.user_id not in started_streams:
+                    try:
+                        await self._on_stream_end(c)
+                    except Exception:
+                        log.exception(f"Xử lý kết thúc live {c.user_id} lỗi")
+            else:
+                level = logging.INFO if c.kind == KIND_STREAM else logging.DEBUG
+                log.log(level, f"🔴 START {c.kind}: {c.user_id} @ {name}")
+                if c.kind == KIND_STREAM and (from_event or c.user_id not in stopped_streams):
+                    try:
+                        await self._on_stream_start(c)
+                    except Exception:
+                        log.exception(f"Xử lý bắt đầu live {c.user_id} lỗi")
 
-        # Log rõ ràng case CTV live ở kênh không phải của mình
-        is_own_channel = cid_str in ctv_data.get(user_id_str, [])
-        if is_own_channel:
-            log.info(f"🔴 LIVE START: {member} @ {channel.name} (kênh của mình)")
-        else:
-            log.info(f"🔴 LIVE START: {member} @ {channel.name} (kênh của CTV KHÁC — tính cho user)")
-
-        # Huỷ next_live của kênh này (nếu có)
+    async def _on_stream_start(self, c: Change) -> None:
+        """CTV bắt đầu LIVE: hủy lịch nhắc của kênh, báo cho khách đăng ký."""
         def _remove_next(data):
-            data.pop(cid_str, None)
+            data.pop(c.channel_id, None)
 
         await db.aupdate("next_live", _remove_next)
 
-        # ===== FIX BUG #3: Notify subs của TẤT CẢ kênh mà CTV này quản lý =====
-        await self._notify_subscribers(channel, member, ctv_data)
+        channel = self.bot.get_channel(int(c.channel_id))
+        member = channel.guild.get_member(int(c.user_id)) if channel else None
+        if channel is None or member is None:
+            return
+        await self._notify_subscribers(channel, member)
 
-    async def _notify_subscribers(
-        self,
-        channel: discord.VoiceChannel,
-        member: discord.Member,
-        ctv_data: dict,
-    ):
+    async def _notify_subscribers(self, channel, member: discord.Member) -> None:
         """
-        Gửi DM cho subs của TẤT CẢ kênh mà CTV này quản lý.
-
-        Ví dụ: CTV Y quản kênh Y1, Y2, Y3. Y live ở kênh X (bất kỳ).
-        → Notify tất cả users đã sub bất kỳ Y1, Y2, Y3 (dedupe).
+        DM cho khách đăng ký BẤT KỲ kênh nào mà CTV này quản lý (dedupe).
+        CTV live ở kênh khác → link dẫn tới kênh đang live thực tế.
         """
-        user_id_str = str(member.id)
-        managed_channels = ctv_data.get(user_id_str, [])
-
+        ctv_data = db.load("ctv")
+        managed_channels = ctv_data.get(str(member.id), [])
         subs_data = db.load("subscribers")
         users_to_notify: set[str] = set()
         for ch_id in managed_channels:
@@ -196,78 +270,30 @@ class LiveTrackerCog(commands.Cog):
                 log.exception(f"Lỗi gửi DM tới {uid}")
 
         log.info(
-            f"Đã DM live tới {sent}/{len(users_to_notify)} sub (fail: {failed}). "
-            f"CTV {member.display_name} → {len(managed_channels)} kênh quản lý được xét."
+            f"Đã DM live tới {sent}/{len(users_to_notify)} khách (lỗi: {failed}). "
+            f"CTV {member.display_name} → {len(managed_channels)} kênh quản lý."
         )
 
-    async def _stop_live(self, channel_id, member_id):
-        """Kết thúc phiên: lưu session, gửi NextLive DM CHỈ KHI user là CTV chính của kênh."""
-        cid_str = str(channel_id)
-
-        if not state.is_live(cid_str):
-            return
-
-        start_dt = state.get_start(cid_str)
-        user_id = state.get_user(cid_str) or str(member_id)
-        state.stop(cid_str)
-
-        if start_dt is None:
-            return
-
-        end_dt = now_vn()
-        duration = (end_dt - start_dt).total_seconds()
-
-        if duration < MIN_SESSION_SECONDS:
-            log.debug(f"Bỏ qua session quá ngắn ({duration}s) kênh {channel_id}")
-            return
-
-        # Lưu session với user_id đầy đủ
-        def _save(sessions):
-            sessions.setdefault(cid_str, []).append({
-                "start_time": start_dt.timestamp(),
-                "end_time": end_dt.timestamp(),
-                "duration": int(duration),
-                "user_id": str(user_id),
-            })
-
-        await db.aupdate("sessions", _save)
-        log.info(f"⚫ LIVE STOP: {user_id} @ kênh {channel_id}, {int(duration)}s")
-
-        # ===== FIX BUG #2: CHỈ gửi NextLive DM khi user là CTV CHÍNH của kênh =====
+    async def _on_stream_end(self, c: Change) -> None:
+        """CTV tắt LIVE: hỏi giờ live tiếp theo (chỉ khi live ở kênh mình quản)."""
         ctv_data = db.load("ctv")
-        is_channel_owner = (
-            str(user_id) in ctv_data
-            and cid_str in ctv_data[str(user_id)]
-        )
-
-        if not is_channel_owner:
-            log.info(
-                f"⏭️ User {user_id} không phải CTV chính của kênh {channel_id}, "
-                f"skip DM chọn giờ live tiếp theo"
-            )
+        if c.channel_id not in (ctv_data.get(c.user_id) or []):
             return
 
-        # OK, gửi DM
+        user = self.bot.get_user(int(c.user_id)) or await self.bot.fetch_user(int(c.user_id))
+        embed = get_custom_embed(
+            EMBED_CTV_NEXT_LIVE,
+            title="🕐 Đặt lịch Live tiếp theo",
+            desc=(
+                f"Cảm ơn bạn đã live kênh **{channel_name(c.channel_id)}**!\n"
+                "Vui lòng chọn giờ Live tiếp theo để Bot nhắc bạn đúng lúc."
+            ),
+            color=discord.Color.blue(),
+        )
         try:
-            user = self.bot.get_user(int(user_id)) or await self.bot.fetch_user(int(user_id))
-            channel = self.bot.get_channel(int(channel_id))
-            channel_name = channel.name if channel else f"Kênh {channel_id}"
-
-            embed = get_custom_embed(
-                EMBED_CTV_NEXT_LIVE,
-                title="🕐 Đặt lịch Live tiếp theo",
-                desc=(
-                    f"Cảm ơn bạn đã live kênh **{channel_name}**!\n"
-                    "Vui lòng chọn giờ Live tiếp theo để Bot nhắc bạn đúng lúc."
-                ),
-                color=discord.Color.blue(),
-            )
-            view = NextLiveView(channel_id)
-            await user.send(embed=embed, view=view)
+            await user.send(embed=embed, view=NextLiveView(c.channel_id))
         except (discord.Forbidden, discord.HTTPException) as e:
-            log.warning(f"Không DM được CTV {user_id} về next live: {e}")
-        except Exception:
-            log.exception(f"Lỗi gửi NextLive DM cho user {user_id}")
+            log.warning(f"Không DM được CTV {c.user_id} về lịch live tiếp theo: {e}")
 
 
 async def setup(bot: commands.Bot):

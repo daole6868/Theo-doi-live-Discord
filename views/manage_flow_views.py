@@ -11,6 +11,9 @@ QUẢN LÝ CTV:
 - Xóa hoàn toàn (bỏ khỏi tất cả kênh + thu hồi mọi role liên quan)
 
 Thao tác nguy hiểm luôn qua ConfirmView (Xác nhận / Hủy).
+
+Lịch sử live KHÔNG bị xóa khi bỏ/xóa CTV hay xóa kênh. Muốn xóa lịch sử của 1 người
+phải bấm nút riêng "🗑️ Xóa lịch sử live" và gõ XOA để xác nhận.
 """
 import logging
 
@@ -18,7 +21,7 @@ import discord
 from discord import ui
 
 from core.data_manager import db
-from core.state import state
+from core.session_store import store
 from helpers.panels import refresh_panel
 
 log = logging.getLogger(__name__)
@@ -144,12 +147,12 @@ class ChannelActionView(ui.View):
                 f"Xóa kênh **{self.channel_name}** khỏi hệ thống Bot?\n\n"
                 "**SẼ LÀM:**\n"
                 "• Xóa khỏi danh sách kênh của Bot\n"
-                "• Xóa tất cả CTV/Subscribers liên kết kênh này\n"
-                "• Hủy phiên đang live (nếu có)\n\n"
+                "• Xóa tất cả CTV/Subscribers liên kết kênh này\n\n"
                 "**KHÔNG động vào:**\n"
                 "• Voice Channel Discord (vẫn còn)\n"
                 "• Role Discord (vẫn còn)\n"
-                "• Lịch sử session (BXH cũ vẫn thấy)"
+                "• Lịch sử live (vẫn giữ nguyên)\n"
+                "• Phiên đang live (vẫn được tính tiếp)"
             ),
             color=discord.Color.orange(),
         )
@@ -222,10 +225,7 @@ class ChannelActionView(ui.View):
         await db.aupdate("next_live", _rm_nl)
         done.append("✓ Xóa lịch live tiếp theo")
 
-        # 5. Xóa live_state
-        state.stop(cid)
-
-        # 6. Xóa Discord voice channel + role (nếu chọn xóa hoàn toàn)
+        # 5. Xóa Discord voice channel + role (nếu chọn xóa hoàn toàn)
         if delete_discord:
             guild = interaction.guild
             try:
@@ -249,7 +249,7 @@ class ChannelActionView(ui.View):
                 except Exception as e:
                     done.append(f"⚠️ Lỗi xóa Role: {e}")
 
-        # 7. Auto-refresh panels
+        # 6. Auto-refresh panels
         try:
             await refresh_panel(interaction.client, "user")
             await refresh_panel(interaction.client, "check_ctv")
@@ -434,6 +434,17 @@ class CTVActionView(ui.View):
         full_btn.callback = self._remove_full_handler
         self.add_item(full_btn)
 
+        history_btn = ui.Button(
+            label="🗑️ Xóa lịch sử live",
+            style=discord.ButtonStyle.danger,
+            row=4,
+        )
+        history_btn.callback = self._delete_history_handler
+        self.add_item(history_btn)
+
+    async def _delete_history_handler(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(DeleteHistoryModal(self.user_id))
+
     def _make_remove_from_channel_handler(self, channel_id: str, channel_name: str):
         async def _handler(interaction: discord.Interaction):
             async def _do(inter):
@@ -495,22 +506,7 @@ class CTVActionView(ui.View):
         except Exception:
             log.exception("Thu hồi role lỗi")
 
-        # 3. XÓA SESSIONS của user này ở kênh này (để giảm data)
-        sessions_removed = 0
-
-        def _rm_sessions(data):
-            nonlocal sessions_removed
-            if cid in data and isinstance(data[cid], list):
-                before = len(data[cid])
-                data[cid] = [
-                    s for s in data[cid]
-                    if str(s.get("user_id", "")) != self.user_id
-                ]
-                sessions_removed = before - len(data[cid])
-
-        await db.aupdate("sessions", _rm_sessions)
-
-        # 4. Refresh
+        # 3. Refresh
         try:
             await refresh_panel(interaction.client, "check_ctv")
         except Exception:
@@ -518,16 +514,13 @@ class CTVActionView(ui.View):
 
         extra = "\n✓ Đã xóa CTV khỏi hệ thống (không còn kênh nào)" if removed_all else ""
         role_text = "\n✓ Đã thu hồi role" if role_removed else "\n⚠️ Không thu hồi được role (thiếu quyền hoặc user không có role)"
-        session_text = f"\n✓ Đã xóa **{sessions_removed}** phiên live liên quan" if sessions_removed else ""
         await interaction.followup.send(
-            f"✅ Đã bỏ CTV <@{self.user_id}> khỏi kênh **{cname}**.{role_text}{session_text}{extra}\n"
+            f"✅ Đã bỏ CTV <@{self.user_id}> khỏi kênh **{cname}**.{role_text}{extra}\n"
+            "📚 Lịch sử live vẫn được giữ nguyên.\n"
             "🔄 Check CTV panel đã cập nhật.",
             ephemeral=True,
         )
-        log.info(
-            f"Admin {interaction.user} bỏ CTV {self.user_id} khỏi kênh {cid} "
-            f"({sessions_removed} sessions xóa)"
-        )
+        log.info(f"Admin {interaction.user} bỏ CTV {self.user_id} khỏi kênh {cid}")
 
     async def _remove_full_handler(self, interaction: discord.Interaction):
         async def _do(inter):
@@ -540,8 +533,9 @@ class CTVActionView(ui.View):
                 "**SẼ LÀM:**\n"
                 "• Bỏ CTV khỏi TẤT CẢ kênh đang quản lý\n"
                 "• Thu hồi TẤT CẢ role liên quan\n"
-                "• Xóa CTV khỏi danh sách bot\n\n"
-                "⚠️ **KHÔNG THỂ hoàn tác!**"
+                "• Xóa CTV khỏi danh sách bot (bot ngừng tính giờ)\n\n"
+                "**KHÔNG động vào:** lịch sử live (vẫn xem được trong Check CTV).\n"
+                "Muốn xóa lịch sử → dùng nút **🗑️ Xóa lịch sử live**."
             ),
             color=discord.Color.red(),
         )
@@ -581,24 +575,7 @@ class CTVActionView(ui.View):
         except Exception:
             log.exception("Thu hồi role lỗi")
 
-        # 3. XÓA TẤT CẢ SESSIONS của user này (mọi kênh)
-        sessions_removed = 0
-
-        def _rm_sessions(data):
-            nonlocal sessions_removed
-            for cid, sess_list in list(data.items()):
-                if not isinstance(sess_list, list):
-                    continue
-                before = len(sess_list)
-                data[cid] = [
-                    s for s in sess_list
-                    if str(s.get("user_id", "")) != self.user_id
-                ]
-                sessions_removed += before - len(data[cid])
-
-        await db.aupdate("sessions", _rm_sessions)
-
-        # 4. Refresh
+        # 3. Refresh
         try:
             await refresh_panel(interaction.client, "check_ctv")
         except Exception:
@@ -608,11 +585,39 @@ class CTVActionView(ui.View):
             f"✅ Đã xóa hoàn toàn CTV <@{self.user_id}>.\n"
             f"✓ Bỏ khỏi {len(channel_list)} kênh\n"
             f"✓ Thu hồi {role_removed} role (fail: {role_failed})\n"
-            f"✓ Xóa **{sessions_removed}** phiên live trong lịch sử\n"
+            "📚 Lịch sử live vẫn được giữ nguyên.\n"
             "🔄 Check CTV panel đã cập nhật.",
             ephemeral=True,
         )
-        log.warning(
-            f"Admin {interaction.user} xóa hoàn toàn CTV {self.user_id} "
-            f"({sessions_removed} sessions xóa)"
+        log.warning(f"Admin {interaction.user} xóa hoàn toàn CTV {self.user_id}")
+
+
+# =========================================================
+#  MODAL: Xóa lịch sử live (phải gõ XOA để xác nhận)
+# =========================================================
+class DeleteHistoryModal(ui.Modal, title="Xóa lịch sử live"):
+    def __init__(self, user_id: str):
+        super().__init__(timeout=300)
+        self.user_id = str(user_id)
+        self.confirm_input = ui.TextInput(
+            label="Gõ XOA để xác nhận (không thể hoàn tác)",
+            placeholder="XOA",
+            max_length=10,
+            required=True,
         )
+        self.add_item(self.confirm_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        typed = self.confirm_input.value.strip().upper().replace("Ó", "O")
+        if typed != "XOA":
+            await interaction.response.send_message(
+                "🚫 Chưa xóa — bạn cần gõ đúng **XOA**.", ephemeral=True,
+            )
+            return
+
+        removed = store.delete_user(self.user_id)
+        await interaction.response.send_message(
+            f"✅ Đã xóa **{removed}** dòng lịch sử live/audio của <@{self.user_id}>.",
+            ephemeral=True,
+        )
+        log.warning(f"Admin {interaction.user} xóa lịch sử live của {self.user_id} ({removed} dòng)")

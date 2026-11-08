@@ -17,6 +17,10 @@ logs/
 
 # Data (backup thủ công, không commit dữ liệu runtime)
 data/*.json
+data/*.db
+data/*.db-*
+data/*.migrated
+data/*.tmp
 !data/.keep
 
 # IDE

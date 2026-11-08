@@ -1,99 +1,114 @@
 """
-Quản lý state runtime: danh sách kênh đang LIVE.
+Trạng thái runtime: mỗi CTV đang ở trong voice có đúng 1 "đoạn" đang chạy.
 
-Cải tiến so với bản cũ (biến `current_lives = {}` trong RAM):
-1. Persist xuống file → bot restart không mất phiên đang live.
-2. Nhất quán key kiểu str (JSON keys luôn là str).
-3. Lưu thêm user_id của CTV đang stream → biết ai cày phiên nào (cho BXH cá nhân).
-4. Datetime tz-aware (giờ VN) → không lỗi khi trừ với now_vn().
-5. API rõ ràng thay cho thao tác dict thô.
+Structure: {user_id (str): {"kind": "stream"|"audio", "channel_id": str, "start_ts": float}}
+
+- kind = "stream": đang bật Go Live (chia sẻ màn hình) → tính là LIVE.
+- kind = "audio":  ở trong kênh voice nhưng không chia sẻ màn hình.
+
+Khác bản cũ (key theo kênh → mỗi kênh chỉ tính 1 người):
+key theo từng CTV, nên nhiều CTV live chung 1 kênh đều được tính riêng,
+và ai tắt Go Live thì chỉ đoạn của người đó bị chốt.
+
+State được ghi xuống file sau mỗi thay đổi để bot restart không mất.
 """
 import datetime
 import logging
 
-from config import VN_TZ
+from config import KIND_STREAM, VN_TZ
 from core.data_manager import db
 
 log = logging.getLogger(__name__)
 
 
 class LiveState:
-    """
-    Structure: {channel_id (str): {"start_ts": float, "user_id": str}}
-
-    - start_ts: UTC timestamp (từ dt.timestamp(), bất kể tz)
-    - user_id: ID của CTV đang stream (str)
-    """
-
     def __init__(self):
         self._data: dict[str, dict] = {}
 
     # ---------- INIT / PERSIST ----------
     def load_from_disk(self) -> None:
-        """Gọi trong on_ready — restore session đang live sau khi bot restart."""
+        """Đọc state từ file. Tự chuyển định dạng cũ (key theo kênh) sang mới."""
         raw = db.load("live_state")
         cleaned: dict[str, dict] = {}
-        for cid, info in raw.items():
-            if isinstance(info, dict) and "start_ts" in info:
-                cleaned[str(cid)] = {
+        legacy = 0
+        for key, info in raw.items():
+            if not isinstance(info, dict) or "start_ts" not in info:
+                continue
+            if "kind" in info and "channel_id" in info:
+                cleaned[str(key)] = {
+                    "kind": str(info["kind"]),
+                    "channel_id": str(info["channel_id"]),
                     "start_ts": float(info["start_ts"]),
-                    "user_id": str(info.get("user_id", "")),
                 }
+            else:
+                # Định dạng cũ: {channel_id: {"start_ts", "user_id"}} — chỉ có stream
+                uid = str(info.get("user_id", "")).strip()
+                if not uid:
+                    continue
+                cleaned[uid] = {
+                    "kind": KIND_STREAM,
+                    "channel_id": str(key),
+                    "start_ts": float(info["start_ts"]),
+                }
+                legacy += 1
         self._data = cleaned
+        if legacy:
+            log.info(f"Chuyển {legacy} phiên live định dạng cũ sang định dạng theo CTV.")
+            self._persist()
         if cleaned:
-            log.info(f"Restore {len(cleaned)} phiên live đang chạy từ disk.")
+            log.info(f"Đọc {len(cleaned)} đoạn đang chạy từ disk.")
 
     def _persist(self) -> None:
         db.save("live_state", self._data)
 
     # ---------- QUERY ----------
-    def is_live(self, channel_id) -> bool:
-        return str(channel_id) in self._data
+    def get(self, user_id) -> dict | None:
+        info = self._data.get(str(user_id))
+        return dict(info) if info else None
 
-    def get_start(self, channel_id) -> datetime.datetime | None:
-        """Trả datetime giờ VN (aware)."""
-        info = self._data.get(str(channel_id))
-        return datetime.datetime.fromtimestamp(info["start_ts"], tz=VN_TZ) if info else None
-
-    def get_user(self, channel_id) -> str | None:
-        info = self._data.get(str(channel_id))
-        return info["user_id"] if info else None
-
-    def all_channel_ids(self) -> list[str]:
+    def user_ids(self) -> list[str]:
         return list(self._data.keys())
 
     def snapshot(self) -> dict[str, dict]:
-        """Copy toàn bộ state — dùng cho task quét (tránh mutate khi iter)."""
-        return {cid: dict(info) for cid, info in self._data.items()}
+        return {uid: dict(info) for uid, info in self._data.items()}
+
+    def is_streaming(self, user_id) -> bool:
+        info = self._data.get(str(user_id))
+        return bool(info and info["kind"] == KIND_STREAM)
+
+    def streams(self) -> dict[str, dict]:
+        """Tất cả CTV đang LIVE: {user_id: info}."""
+        return {uid: dict(i) for uid, i in self._data.items() if i["kind"] == KIND_STREAM}
+
+    def streams_in_channel(self, channel_id) -> dict[str, dict]:
+        cid = str(channel_id)
+        return {
+            uid: dict(i) for uid, i in self._data.items()
+            if i["kind"] == KIND_STREAM and i["channel_id"] == cid
+        }
+
+    def channel_has_stream(self, channel_id) -> bool:
+        cid = str(channel_id)
+        return any(i["kind"] == KIND_STREAM and i["channel_id"] == cid for i in self._data.values())
+
+    @staticmethod
+    def start_dt(info: dict) -> datetime.datetime:
+        return datetime.datetime.fromtimestamp(info["start_ts"], tz=VN_TZ)
 
     # ---------- MUTATE ----------
-    def start(self, channel_id, user_id, when: datetime.datetime | None = None) -> None:
-        if when is None:
-            when = datetime.datetime.now(VN_TZ)
-        elif when.tzinfo is None:
-            # Naive → assume VN
-            when = when.replace(tzinfo=VN_TZ)
-        self._data[str(channel_id)] = {
-            "start_ts": when.timestamp(),
-            "user_id": str(user_id),
+    def set(self, user_id, kind: str, channel_id, start_ts: float) -> None:
+        self._data[str(user_id)] = {
+            "kind": kind,
+            "channel_id": str(channel_id),
+            "start_ts": float(start_ts),
         }
         self._persist()
 
-    def stop(self, channel_id) -> dict | None:
-        """Pop session ra khỏi state, return info (dict) hoặc None."""
-        info = self._data.pop(str(channel_id), None)
+    def pop(self, user_id) -> dict | None:
+        info = self._data.pop(str(user_id), None)
         if info is not None:
             self._persist()
         return info
-
-    def reset_start(self, channel_id, when: datetime.datetime) -> None:
-        """Đổi mốc bắt đầu — dùng cho midnight cutoff (cắt session qua ngày)."""
-        cid = str(channel_id)
-        if cid in self._data:
-            if when.tzinfo is None:
-                when = when.replace(tzinfo=VN_TZ)
-            self._data[cid]["start_ts"] = when.timestamp()
-            self._persist()
 
 
 # Singleton
