@@ -91,11 +91,12 @@ class NextLiveModal(ui.Modal, title="Đặt Giờ Live Tiếp Theo"):
 
         time_str = f"{hour:02d}:{minute:02d}"
 
+        # Lịch gắn theo từng CTV (channel_id chỉ để tạo link "Live Ngay")
         def _save(data):
-            data[self.channel_id] = {
+            data[str(interaction.user.id)] = {
                 "time": target.timestamp(),
                 "time_str": time_str,
-                "user_id": interaction.user.id,
+                "channel_id": self.channel_id,
                 "reminders_sent": 0,
             }
 
@@ -120,9 +121,7 @@ class NextLiveModal(ui.Modal, title="Đặt Giờ Live Tiếp Theo"):
                     ephemeral=True,
                 )
 
-        log.info(
-            f"CTV {interaction.user.id} đặt lịch live kênh {self.channel_id} lúc {time_str}"
-        )
+        log.info(f"CTV {interaction.user.id} đặt lịch live lúc {time_str} (kênh {self.channel_id})")
 
 
 # =========================================================

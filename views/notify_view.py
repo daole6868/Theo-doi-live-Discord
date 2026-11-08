@@ -4,8 +4,8 @@ Views cho DM:
 - ReminderView: gửi khi đến giờ Live cho CTV (Live Ngay + 3 mức Hoãn).
 
 FEATURE MỚI: ReminderView có 3 nút hoãn (5 phút / 30 phút / 1 tiếng).
-Khi CTV bấm hoãn → update time_str trong data_next_live.json → khách bấm chọn kênh
-sẽ thấy giờ mới ngay (do CustomerView đọc live từ file).
+Khi CTV bấm hoãn → update time_str trong data_next_live.json (key theo CTV) → khách
+bấm chọn kênh sẽ thấy giờ mới ngay (do CustomerView đọc live từ file).
 
 Persistent qua DynamicItem — sau bot restart bấm nút vẫn work.
 Cần đăng ký trong main.py: bot.add_dynamic_items(NotifyOffButton, ReminderDelayButton)
@@ -130,10 +130,11 @@ class ReminderDelayButton(
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer()
 
+        uid = str(interaction.user.id)
         nl_data = db.load("next_live")
-        if self.channel_id not in nl_data:
+        if uid not in nl_data:
             await interaction.followup.send(
-                "⚠️ Lịch live này đã bị hủy (do bạn đã vào kênh hoặc đã quá hạn 30 phút).",
+                "⚠️ Lịch live này đã bị hủy (do bạn đã live hoặc đã quá hạn).",
                 ephemeral=True,
             )
             return
@@ -144,10 +145,10 @@ class ReminderDelayButton(
         new_time_str = new_dt.strftime("%H:%M")
 
         def _save(data):
-            if self.channel_id in data and isinstance(data[self.channel_id], dict):
-                data[self.channel_id]["time"] = new_dt.timestamp()
-                data[self.channel_id]["time_str"] = new_time_str
-                data[self.channel_id]["reminders_sent"] = 0
+            if uid in data and isinstance(data[uid], dict):
+                data[uid]["time"] = new_dt.timestamp()
+                data[uid]["time_str"] = new_time_str
+                data[uid]["reminders_sent"] = 0
 
         await db.aupdate("next_live", _save)
 
@@ -168,10 +169,7 @@ class ReminderDelayButton(
             f"Giờ Live mới: **{new_time_str}**. Chuẩn bị nhé!",
             ephemeral=True,
         )
-        log.info(
-            f"CTV {interaction.user.id} hoãn reminder kênh {self.channel_id} "
-            f"thêm {minutes} phút → {new_time_str}"
-        )
+        log.info(f"CTV {uid} hoãn nhắc live thêm {minutes} phút → {new_time_str}")
 
 
 # =========================================================

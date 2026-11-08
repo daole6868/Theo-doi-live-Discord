@@ -120,6 +120,41 @@ def migrate_sessions_to_sqlite():
     log.info(f"✓ Migrate: chuyển {imported} phiên sang SQLite (bỏ qua {skipped})")
 
 
+def migrate_next_live_per_user():
+    """
+    Lịch live tiếp theo: đổi key từ kênh sang từng CTV.
+
+    Cũ:  {channel_id: {"time", "time_str", "user_id", "reminders_sent"}}
+    Mới: {user_id:    {"time", "time_str", "channel_id", "reminders_sent"}}
+    Nếu 1 CTV có nhiều lịch (nhiều kênh) → giữ lịch sớm nhất.
+    """
+    data = db.load("next_live")
+    if not any(isinstance(v, dict) and "user_id" in v for v in data.values()):
+        return
+
+    new: dict[str, dict] = {}
+    for key, info in data.items():
+        if not isinstance(info, dict):
+            continue
+        if "user_id" not in info:
+            new[str(key)] = info  # đã là định dạng mới
+            continue
+        uid = str(info.get("user_id", "")).strip()
+        if not uid or not info.get("time"):
+            continue
+        entry = {
+            "time": info["time"],
+            "time_str": info.get("time_str", "?"),
+            "channel_id": str(key),
+            "reminders_sent": int(info.get("reminders_sent", 0)),
+        }
+        if uid not in new or entry["time"] < new[uid]["time"]:
+            new[uid] = entry
+
+    db.save("next_live", new)
+    log.info(f"✓ Migrate: chuyển {len(new)} lịch live tiếp theo sang key theo CTV")
+
+
 def run_all_migrations():
     """Gọi trong setup_hook của main.py."""
     log.info("=" * 40)
@@ -136,5 +171,9 @@ def run_all_migrations():
         migrate_sessions_to_sqlite()
     except Exception:
         log.exception("migrate_sessions_to_sqlite lỗi")
+    try:
+        migrate_next_live_per_user()
+    except Exception:
+        log.exception("migrate_next_live_per_user lỗi")
     log.info("Migrations xong.")
     log.info("=" * 40)

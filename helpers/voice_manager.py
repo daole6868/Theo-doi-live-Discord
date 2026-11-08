@@ -13,6 +13,18 @@ import discord
 log = logging.getLogger(__name__)
 
 
+# Hàng đợi phát loa: mỗi server chỉ phát 1 audio tại 1 thời điểm.
+# Voice Alert và "Gửi Voice" dùng chung → không cắt ngang nhau.
+_guild_locks: dict[int, asyncio.Lock] = {}
+
+
+def _guild_lock(guild_id: int) -> asyncio.Lock:
+    lock = _guild_locks.get(guild_id)
+    if lock is None:
+        lock = _guild_locks[guild_id] = asyncio.Lock()
+    return lock
+
+
 async def play_audio_in_channel(
     channel: discord.VoiceChannel,
     audio_file_path: str,
@@ -22,6 +34,8 @@ async def play_audio_in_channel(
     """
     Kết nối voice channel, phát audio, tự động ngắt kết nối.
 
+    Các lượt phát trong cùng server được xếp hàng lần lượt.
+
     Args:
         channel: kênh voice cần phát
         audio_file_path: đường dẫn file mp3
@@ -30,6 +44,16 @@ async def play_audio_in_channel(
 
     Return: True nếu phát thành công.
     """
+    async with _guild_lock(channel.guild.id):
+        return await _play_unlocked(channel, audio_file_path, max_wait_seconds, volume)
+
+
+async def _play_unlocked(
+    channel: discord.VoiceChannel,
+    audio_file_path: str,
+    max_wait_seconds: float,
+    volume: float,
+) -> bool:
     voice_client: discord.VoiceClient | None = None
 
     try:

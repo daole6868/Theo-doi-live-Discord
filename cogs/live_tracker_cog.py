@@ -7,6 +7,10 @@ Live Tracker Cog — tính giờ LIVE (chia sẻ màn hình) và AUDIO cho từn
 - Mất kết nối Discord rồi vào lại: đối chiếu, đoạn nào lệch thì chốt tại lúc mất kết nối.
 - Định kỳ 5 phút: đối chiếu lại để bắt các sự kiện bị lỡ.
 - Nhịp tim mỗi 30 giây.
+
+Khi CTV bắt đầu LIVE (ở bất kỳ kênh nào): hủy lịch nhắc của chính CTV đó và báo
+cho khách đăng ký các kênh CTV đó quản lý (mỗi CTV tối đa 1 lần / 30 phút).
+Khi CTV tắt LIVE: chờ 2 phút, nếu không bật lại thì DM hỏi giờ live tiếp theo.
 """
 import asyncio
 import logging
@@ -20,6 +24,8 @@ from config import (
     HEARTBEAT_SECONDS,
     KIND_STREAM,
     LEGACY_LIVE_MAX_HOURS,
+    NEXT_LIVE_PROMPT_DELAY_SECONDS,
+    NOTIFY_COOLDOWN_MINUTES,
     RECONCILE_MINUTES,
     is_main_guild,
 )
@@ -44,16 +50,22 @@ class LiveTrackerCog(commands.Cog):
         self._started = False          # đã chạy đối chiếu khởi động chưa
         self._connected = False
         self._disconnected_at: float | None = None
+        # user_id → ts lần cuối báo live cho khách (chống spam khi tắt/bật Go Live)
+        self._last_notified: dict[str, float] = {}
+        # user_id → (channel_id đã live, thời điểm sẽ hỏi giờ live tiếp theo)
+        self._pending_prompts: dict[str, tuple[str, float]] = {}
 
     async def cog_load(self):
         # Đọc state trước khi nhận sự kiện (sự kiện bị bỏ qua cho đến khi đối chiếu xong)
         state.load_from_disk()
         self.heartbeat.start()
         self.periodic_reconcile.start()
+        self.next_live_prompts.start()
 
     async def cog_unload(self):
         self.heartbeat.cancel()
         self.periodic_reconcile.cancel()
+        self.next_live_prompts.cancel()
 
     # =====================================================
     #  TRẠNG THÁI THỰC TẾ TỪ DISCORD
@@ -180,8 +192,23 @@ class LiveTrackerCog(commands.Cog):
         except Exception:
             log.exception("Đối chiếu định kỳ lỗi")
 
+    @tasks.loop(seconds=30)
+    async def next_live_prompts(self):
+        """Gửi DM hỏi giờ live tiếp theo cho CTV đã tắt live đủ 2 phút."""
+        now = now_ts()
+        due = [(uid, cid) for uid, (cid, at) in self._pending_prompts.items() if at <= now]
+        for uid, cid in due:
+            self._pending_prompts.pop(uid, None)
+            if state.is_streaming(uid):
+                continue  # Đã bật lại live → chưa cần hỏi
+            try:
+                await self._send_next_live_prompt(uid, cid)
+            except Exception:
+                log.exception(f"Gửi DM hỏi giờ live tiếp theo cho {uid} lỗi")
+
     @heartbeat.before_loop
     @periodic_reconcile.before_loop
+    @next_live_prompts.before_loop
     async def _wait_ready(self):
         await self.bot.wait_until_ready()
 
@@ -217,16 +244,24 @@ class LiveTrackerCog(commands.Cog):
                         log.exception(f"Xử lý bắt đầu live {c.user_id} lỗi")
 
     async def _on_stream_start(self, c: Change) -> None:
-        """CTV bắt đầu LIVE: hủy lịch nhắc của kênh, báo cho khách đăng ký."""
+        """CTV bắt đầu LIVE: hủy lịch nhắc của chính CTV đó, báo cho khách đăng ký."""
+        self._pending_prompts.pop(c.user_id, None)
+
         def _remove_next(data):
-            data.pop(c.channel_id, None)
+            data.pop(c.user_id, None)
 
         await db.aupdate("next_live", _remove_next)
+
+        last = self._last_notified.get(c.user_id)
+        if last is not None and c.start_ts - last < NOTIFY_COOLDOWN_MINUTES * 60:
+            log.info(f"⏭️ Bỏ qua DM báo live cho khách của {c.user_id} (đã báo trong {NOTIFY_COOLDOWN_MINUTES} phút)")
+            return
 
         channel = self.bot.get_channel(int(c.channel_id))
         member = channel.guild.get_member(int(c.user_id)) if channel else None
         if channel is None or member is None:
             return
+        self._last_notified[c.user_id] = c.start_ts
         await self._notify_subscribers(channel, member)
 
     async def _notify_subscribers(self, channel, member: discord.Member) -> None:
@@ -275,25 +310,31 @@ class LiveTrackerCog(commands.Cog):
         )
 
     async def _on_stream_end(self, c: Change) -> None:
-        """CTV tắt LIVE: hỏi giờ live tiếp theo (chỉ khi live ở kênh mình quản)."""
-        ctv_data = db.load("ctv")
-        if c.channel_id not in (ctv_data.get(c.user_id) or []):
-            return
+        """CTV tắt LIVE: hẹn 2 phút sau hỏi giờ live tiếp theo (nếu không bật lại)."""
+        self._pending_prompts[c.user_id] = (c.channel_id, now_ts() + NEXT_LIVE_PROMPT_DELAY_SECONDS)
 
-        user = self.bot.get_user(int(c.user_id)) or await self.bot.fetch_user(int(c.user_id))
+    async def _send_next_live_prompt(self, user_id: str, lived_channel_id: str) -> None:
+        ctv_data = db.load("ctv")
+        own = [str(x) for x in (ctv_data.get(user_id) or [])]
+        if user_id not in ctv_data:
+            return
+        # Link "Live Ngay" trong tin nhắc: kênh vừa live nếu là kênh mình, không thì kênh mình đầu tiên
+        link_cid = lived_channel_id if (lived_channel_id in own or not own) else own[0]
+
+        user = self.bot.get_user(int(user_id)) or await self.bot.fetch_user(int(user_id))
         embed = get_custom_embed(
             EMBED_CTV_NEXT_LIVE,
             title="🕐 Đặt lịch Live tiếp theo",
             desc=(
-                f"Cảm ơn bạn đã live kênh **{channel_name(c.channel_id)}**!\n"
+                f"Cảm ơn bạn đã live tại kênh **{channel_name(lived_channel_id)}**!\n"
                 "Vui lòng chọn giờ Live tiếp theo để Bot nhắc bạn đúng lúc."
             ),
             color=discord.Color.blue(),
         )
         try:
-            await user.send(embed=embed, view=NextLiveView(c.channel_id))
+            await user.send(embed=embed, view=NextLiveView(link_cid))
         except (discord.Forbidden, discord.HTTPException) as e:
-            log.warning(f"Không DM được CTV {c.user_id} về lịch live tiếp theo: {e}")
+            log.warning(f"Không DM được CTV {user_id} về lịch live tiếp theo: {e}")
 
 
 async def setup(bot: commands.Bot):

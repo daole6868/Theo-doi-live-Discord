@@ -255,14 +255,21 @@ class UserChannelSelect(ui.Select):
                 )
 
         # ==== [4] LỊCH LIVE TIẾP THEO ====
+        # Lịch gắn theo từng CTV → lấy lịch sớm nhất của các CTV chủ kênh
         nl_data = db.load("next_live")
         next_live_text = ""
-        if not real_live and channel_id in nl_data:
-            info = nl_data[channel_id]
-            if isinstance(info, dict):
-                next_live_text = f"\n**🎀 Phiên Live tiếp theo:** `{info.get('time_str', 'Chưa rõ')}`"
-            else:
-                next_live_text = f"\n**🎀 Phiên Live tiếp theo:** `{info}`"
+        if not real_live and not live_elsewhere:
+            upcoming = [
+                nl_data[uid] for uid in owners
+                if isinstance(nl_data.get(uid), dict) and nl_data[uid].get("time")
+            ]
+            if upcoming:
+                info = min(upcoming, key=lambda x: x["time"])
+                when = from_ts(info["time"])
+                day_note = "" if when.date() == now_check.date() else f" ngày {when.strftime('%d/%m')}"
+                next_live_text = (
+                    f"\n**🎀 Phiên Live tiếp theo:** `{info.get('time_str', when.strftime('%H:%M'))}`{day_note}"
+                )
 
         status_line = f"**Trạng thái:** {status_text}{next_live_text}"
 

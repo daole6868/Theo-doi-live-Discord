@@ -1,17 +1,22 @@
 """
-Voice Alert Cog — nhắc CTV vào voice channel nhưng chưa bật Go Live.
+Voice Alert Cog — nhắc CTV ở trong voice mà không bật Go Live.
 
 LOGIC:
-1. CTV vào voice channel (chưa self_stream) → ghi vào voice_alerts state.
-2. Task chạy mỗi phút:
-   - Sau `delay_before_alert_minutes` (default 15) → bắt đầu nhắc.
-   - Trong cửa sổ `alert_window_minutes` (default 15), phát TTS `alert_count` (default 5) lần cách đều.
-   - Sau hết window vẫn chưa live → kick khỏi voice channel + log.
-3. CTV bật Go Live bất cứ lúc nào → xóa khỏi voice_alerts state.
-4. CTV rời voice → xóa khỏi voice_alerts state.
+1. CTV ở trong BẤT KỲ kênh voice nào của server (trừ kênh AFK), không chia sẻ màn hình,
+   và trong kênh đó không có CTV nào đang live → tính giờ (joined_ts).
+   Kênh đang có CTV live → coi như đang xem, không nhắc.
+2. Task mỗi 20 giây:
+   - Sau `delay_before_alert_minutes` (mặc định 15) → bắt đầu nhắc.
+   - Trong `alert_window_minutes` (mặc định 15), phát giọng nói `alert_count` lần cách đều.
+   - Hết cửa sổ vẫn chưa live → ngắt khỏi voice + ghi log.
+3. Bật Go Live → xóa đồng hồ.
+4. Rời voice / sang kênh đang có người live → TẠM DỪNG đồng hồ.
+   Quay lại trong 5 phút → giữ đồng hồ cũ (chống lách bằng cách ra vào liên tục).
+   Quá 5 phút → đồng hồ mới. Chuyển thẳng sang kênh khác → giữ đồng hồ.
+5. Mỗi sự kiện voice: xét lại TẤT CẢ CTV trong kênh cũ và kênh mới
+   (vd. CTV đang live rời đi → các CTV còn ngồi audio bắt đầu bị tính giờ).
 
-QUAN TRỌNG: Cog này KHÔNG động vào session tracking cũ (live_tracker_cog).
-Chỉ track "voice thoại chưa live" — không nhầm với "live thật".
+Cog này KHÔNG động vào việc tính giờ live/audio (live_tracker_cog).
 """
 import asyncio
 import logging
@@ -19,158 +24,164 @@ import logging
 import discord
 from discord.ext import commands, tasks
 
+from config import LATE_ALERT_CHANNEL_ID, VOICE_ALERT_REJOIN_GRACE_MINUTES, is_main_guild
 from core.data_manager import db
-from core.state import state
-from helpers.time_utils import now_vn, from_ts, fmt_dur, fmt_full, now_ts
+from helpers.time_utils import from_ts, fmt_dur, fmt_full, now_ts, now_vn
 from helpers.tts import generate_tts_file, cleanup_tts_file, DEFAULT_VOICE
 from helpers.voice_manager import play_audio_in_channel, kick_from_voice
 
 log = logging.getLogger(__name__)
 
+GRACE_SECONDS = VOICE_ALERT_REJOIN_GRACE_MINUTES * 60
+
+STATUS_STREAMING = "streaming"   # đang chia sẻ màn hình
+STATUS_TRACK = "track"           # cần tính giờ
+STATUS_AWAY = "away"             # không ở voice / đang xem live / kênh AFK
+
+
+def _same_ts(a, b) -> bool:
+    try:
+        return abs(float(a) - float(b)) < 1e-6
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_afk(channel) -> bool:
+    afk = getattr(channel.guild, "afk_channel", None)
+    return afk is not None and afk.id == channel.id
+
+
+def _channel_has_ctv_stream(channel, ctv_data: dict) -> bool:
+    return any(
+        not m.bot and str(m.id) in ctv_data and m.voice is not None and m.voice.self_stream
+        for m in channel.members
+    )
+
+
+def classify(member, ctv_data: dict) -> tuple[str, str | None]:
+    """Trạng thái Voice Alert của 1 CTV: (status, channel_id)."""
+    voice = member.voice
+    if voice is None or voice.channel is None:
+        return STATUS_AWAY, None
+    ch = voice.channel
+    if not is_main_guild(ch.guild) or _is_afk(ch):
+        return STATUS_AWAY, None
+    if getattr(ch, "type", None) == discord.ChannelType.stage_voice:
+        return STATUS_AWAY, None
+    if voice.self_stream:
+        return STATUS_STREAMING, str(ch.id)
+    if _channel_has_ctv_stream(ch, ctv_data):
+        return STATUS_AWAY, str(ch.id)  # đang xem CTV khác live
+    return STATUS_TRACK, str(ch.id)
+
+
+def apply_member(data: dict, member, ctv_data: dict, now: float) -> str | None:
+    """Cập nhật đồng hồ của 1 người trong `data` (mutate). Trả về ghi chú để log."""
+    uid = str(member.id)
+    entry = data.get(uid)
+    if uid not in ctv_data:
+        if entry is not None:
+            data.pop(uid, None)
+            return "không còn là CTV → xóa đồng hồ"
+        return None
+
+    status, cid = classify(member, ctv_data)
+
+    if status == STATUS_STREAMING:
+        if entry is not None:
+            data.pop(uid, None)
+            return "bật Go Live → xóa đồng hồ"
+        return None
+
+    if status == STATUS_TRACK:
+        if entry is None:
+            data[uid] = {"channel_id": cid, "joined_ts": now, "alerts_sent": 0}
+            return f"bắt đầu tính giờ tại kênh {cid}"
+        if entry.get("paused_ts"):
+            if now - float(entry["paused_ts"]) <= GRACE_SECONDS:
+                entry.pop("paused_ts", None)
+                entry["channel_id"] = cid
+                return f"quay lại trong {VOICE_ALERT_REJOIN_GRACE_MINUTES} phút → giữ đồng hồ cũ"
+            data[uid] = {"channel_id": cid, "joined_ts": now, "alerts_sent": 0}
+            return "quay lại sau thời gian chờ → đồng hồ mới"
+        if entry.get("channel_id") != cid:
+            entry["channel_id"] = cid
+            return f"chuyển sang kênh {cid} → giữ đồng hồ"
+        return None
+
+    # STATUS_AWAY
+    if entry is not None and not entry.get("paused_ts"):
+        entry["paused_ts"] = now
+        return "rời voice / đang xem live → tạm dừng đồng hồ"
+    return None
+
 
 class VoiceAlertCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # Set lock để tránh 2 task phát audio cùng lúc trong cùng guild
-        self._play_locks: dict[int, asyncio.Lock] = {}
         self._synced = False
+        self._was_enabled: bool | None = None
+        self._eval_lock = asyncio.Lock()
+        self._tasks: set[asyncio.Task] = set()
         self.check_voice_alerts.start()
 
     def cog_unload(self):
         self.check_voice_alerts.cancel()
 
-    def _get_play_lock(self, guild_id: int) -> asyncio.Lock:
-        if guild_id not in self._play_locks:
-            self._play_locks[guild_id] = asyncio.Lock()
-        return self._play_locks[guild_id]
+    def _spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
-    def _is_managed(self, channel_id) -> bool:
-        return str(channel_id) in db.load("channels")
+    def _main_guilds(self):
+        return [g for g in self.bot.guilds if is_main_guild(g)]
 
     # =====================================================
-    #  ON READY — sync voice_alerts với thực tế Discord
+    #  ĐỐI CHIẾU TOÀN BỘ
     # =====================================================
+    async def _full_sync(self, reason: str) -> None:
+        """Xét lại mọi CTV đang trong voice + mọi đồng hồ đang có."""
+        ctv_data = db.load("ctv")
+        members: dict[int, discord.Member] = {}
+        for guild in self._main_guilds():
+            for channel in guild.voice_channels:
+                for m in channel.members:
+                    if not m.bot and str(m.id) in ctv_data:
+                        members[m.id] = m
+
+        async with self._eval_lock:
+            now = now_ts()
+            notes: list[tuple[str, str]] = []
+
+            def _apply(data):
+                for m in members.values():
+                    note = apply_member(data, m, ctv_data, now)
+                    if note:
+                        notes.append((m.display_name, note))
+                # Đồng hồ của người không còn trong voice → tạm dừng
+                for uid, entry in list(data.items()):
+                    if not uid.isdigit() or not isinstance(entry, dict):
+                        data.pop(uid, None)
+                        continue
+                    if int(uid) in members:
+                        continue
+                    if uid not in ctv_data:
+                        data.pop(uid, None)
+                    elif not entry.get("paused_ts"):
+                        entry["paused_ts"] = now
+
+            await db.aupdate("voice_alerts", _apply)
+
+        for name, note in notes:
+            log.info(f"🎙️ [voice-alert:{reason}] {name}: {note}")
+
     @commands.Cog.listener()
     async def on_ready(self):
         if self._synced:
             return
         self._synced = True
-        await self._sync_voice_alerts_state()
-
-    async def _sync_voice_alerts_state(self):
-        """
-        Reconcile voice_alerts state với thực tế Discord sau restart.
-
-        - Xóa entry nếu CTV không còn trong voice channel tương ứng (rời, chuyển, bật Live).
-        - Thêm entry mới nếu phát hiện CTV đang thoại nhưng chưa được track.
-        - Giữ nguyên joined_ts + alerts_sent cho entry vẫn valid (không reset timer).
-        """
-        voice_alerts = db.load("voice_alerts")
-        ctv_data = db.load("ctv")
-        channels_data = db.load("channels")
-
-        to_remove: list[str] = []
-        to_add: dict[str, dict] = {}
-        valid_uids: set[str] = set()
-
-        # 1. Verify existing entries — Option D: kênh managed + chưa có ai live
-        for uid, info in voice_alerts.items():
-            channel_id = info.get("channel_id")
-            if not channel_id or not uid.isdigit():
-                to_remove.append(uid)
-                continue
-
-            channel = self.bot.get_channel(int(channel_id))
-            if not isinstance(channel, discord.VoiceChannel):
-                to_remove.append(uid)
-                continue
-
-            # Kênh có ai đang live không? (Option D)
-            if state.channel_has_stream(channel_id):
-                to_remove.append(uid)
-                log.info(f"[sync] Remove {uid}: kênh {channel_id} đã có người live")
-                continue
-
-            member = channel.guild.get_member(int(uid))
-            if not member:
-                # Cache chưa có → giữ entry, sẽ verify sau khi member cache load
-                log.debug(f"[sync] Member {uid} chưa cache, giữ entry")
-                valid_uids.add(uid)
-                continue
-
-            # Verify voice state
-            if member.voice is None:
-                # State chưa sync sau restart, giữ entry để chờ Discord cập nhật
-                log.debug(f"[sync] {uid} voice state null (chưa sync), giữ entry")
-                valid_uids.add(uid)
-                continue
-
-            if member.voice.channel is None:
-                # User đã rời voice thật (state đã sync) → remove
-                to_remove.append(uid)
-                continue
-
-            if member.voice.channel.id != int(channel_id):
-                # User đã chuyển kênh khác → remove
-                to_remove.append(uid)
-                continue
-
-            if member.voice.self_stream:
-                # User đã bật Live → remove
-                to_remove.append(uid)
-                continue
-
-            valid_uids.add(uid)
-
-        # 2. Scan voice channels tìm CTV đang thoại nhưng chưa track
-        # (Option D: chỉ track nếu kênh chưa có ai live — không cần "kênh mình quản")
-        for cid_str in channels_data.keys():
-            try:
-                cid_int = int(cid_str)
-            except ValueError:
-                continue
-            channel = self.bot.get_channel(cid_int)
-            if not isinstance(channel, discord.VoiceChannel):
-                continue
-
-            # Nếu kênh này đã có người live → không track ai vào kênh này (Option D)
-            if state.channel_has_stream(cid_str):
-                continue
-
-            for member in channel.members:
-                if member.bot:
-                    continue
-                uid_str = str(member.id)
-                if uid_str not in ctv_data:
-                    continue  # Không phải CTV
-                if member.voice.self_stream:
-                    continue  # Đang stream (LiveTrackerCog đã handle)
-                if uid_str in valid_uids:
-                    continue  # Đã track
-                # OK → thêm mới (không cần check kênh có phải mình quản không)
-                to_add[uid_str] = {
-                    "channel_id": cid_str,
-                    "joined_ts": now_ts(),
-                    "alerts_sent": 0,
-                }
-                ctv_own = cid_str in ctv_data.get(uid_str, [])
-                marker = "" if ctv_own else " (kênh khác)"
-                log.info(f"🎙️ [sync] Detect CTV {member.display_name} tại #{channel.name}{marker}")
-
-        # Apply
-        if to_remove or to_add:
-            def _apply(data):
-                for uid in to_remove:
-                    data.pop(uid, None)
-                for uid, entry in to_add.items():
-                    data[uid] = entry
-
-            await db.aupdate("voice_alerts", _apply)
-            log.info(
-                f"[sync voice_alerts] Xóa {len(to_remove)} entry stale, thêm {len(to_add)} entry mới"
-            )
-        else:
-            log.debug("[sync voice_alerts] Không có thay đổi")
+        if db.load("voice_settings").get("enabled", True):
+            await self._full_sync("khởi động")
 
     # =====================================================
     #  EVENT: voice state update
@@ -182,94 +193,60 @@ class VoiceAlertCog(commands.Cog):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ):
-        if member.bot:
+        if member.bot or not is_main_guild(member.guild):
+            return
+        if not db.load("voice_settings").get("enabled", True):
             return
 
-        # Chỉ track CTV
         ctv_data = db.load("ctv")
-        user_id_str = str(member.id)
-        if user_id_str not in ctv_data:
+        # Xét người vừa thay đổi + mọi CTV trong kênh cũ và kênh mới
+        members: dict[int, discord.Member] = {}
+        if str(member.id) in ctv_data:
+            members[member.id] = member
+        for ch in (before.channel, after.channel):
+            if ch is None:
+                continue
+            for m in ch.members:
+                if not m.bot and str(m.id) in ctv_data:
+                    members[m.id] = m
+        if not members:
             return
 
-        # Check settings enabled
-        settings = db.load("voice_settings")
-        if not settings.get("enabled", True):
-            return
+        async with self._eval_lock:
+            now = now_ts()
+            notes: list[tuple[str, str]] = []
 
-        # Xác định state hiện tại từ `after`
-        in_voice = bool(after.channel)
-        is_streaming = bool(after.self_stream) if in_voice else False
-        cid_str = str(after.channel.id) if in_voice else ""
-        channel_managed = self._is_managed(after.channel.id) if in_voice else False
+            def _apply(data):
+                for m in members.values():
+                    note = apply_member(data, m, ctv_data, now)
+                    if note:
+                        notes.append((m.display_name, note))
 
-        # Option D — 4 điều kiện phải đều thỏa:
-        # 1. Đang trong voice
-        # 2. Không stream
-        # 3. Kênh bot quản lý (managed)
-        # 4. Kênh chưa có ai đang live (state.channel_has_stream = False)
-        # → KHÔNG check "kênh mình quản" — mọi CTV trong kênh chưa live đều bị nhắc
-        channel_is_live = state.channel_has_stream(cid_str) if cid_str else False
+            await db.aupdate("voice_alerts", _apply)
 
-        should_track = (
-            in_voice
-            and not is_streaming
-            and channel_managed
-            and not channel_is_live
-        )
-
-        current_alerts = db.load("voice_alerts")
-        existing = current_alerts.get(user_id_str)
-
-        if should_track:
-            # Cùng kênh → giữ nguyên (không reset timer)
-            if existing and existing.get("channel_id") == cid_str:
-                return
-
-            def _add(data):
-                data[user_id_str] = {
-                    "channel_id": cid_str,
-                    "joined_ts": now_ts(),
-                    "alerts_sent": 0,
-                }
-
-            await db.aupdate("voice_alerts", _add)
-
-            # Log rõ có phải kênh mình quản hay không
-            ctv_own = user_id_str in ctv_data and cid_str in ctv_data[user_id_str]
-            marker = "" if ctv_own else " (kênh CTV khác - vẫn nhắc vì chưa ai live)"
-            log.info(f"🎙️ CTV {member} vào voice #{after.channel.name}{marker}")
-
-        else:
-            # Không nên track → xóa entry nếu có
-            if existing:
-                def _rm(data):
-                    data.pop(user_id_str, None)
-
-                await db.aupdate("voice_alerts", _rm)
-
-                # Log lý do
-                if is_streaming:
-                    log.info(f"CTV {member} đã bật Go Live → xóa voice_alert entry")
-                elif not in_voice:
-                    log.info(f"CTV {member} đã rời voice → xóa voice_alert entry")
-                elif not channel_managed:
-                    log.info(f"CTV {member} chuyển sang kênh không managed → xóa entry")
-                elif channel_is_live:
-                    log.info(f"CTV {member} vào kênh đã có người live (chỉ xem) → xóa entry")
-
-            # Log info khi không track (dù không có entry cũ)
-            elif in_voice and channel_managed and not is_streaming and channel_is_live:
-                log.info(f"⏭️ CTV {member} vào #{after.channel.name} (đã có người live, chỉ xem)")
+        for name, note in notes:
+            log.info(f"🎙️ [voice-alert] {name}: {note}")
 
     # =====================================================
-    #  TASK: check voice alerts mỗi 20 giây (thay vì 1 phút để timing chính xác hơn)
+    #  TASK: kiểm tra mỗi 20 giây
     # =====================================================
     @tasks.loop(seconds=20)
     async def check_voice_alerts(self):
         try:
             settings = db.load("voice_settings")
-            if not settings.get("enabled", True):
+            enabled = settings.get("enabled", True)
+
+            if not enabled:
+                # Tắt tính năng → xóa mọi đồng hồ (tránh đồng hồ cũ kick nhầm khi bật lại)
+                if self._was_enabled is not False:
+                    await db.asave("voice_alerts", {})
+                self._was_enabled = False
                 return
+            if self._was_enabled is False:
+                # Vừa bật lại → tính giờ mới cho người đang ngồi trong voice
+                self._was_enabled = True
+                await self._full_sync("bật lại tính năng")
+            self._was_enabled = True
 
             delay_sec = max(0, int(settings.get("delay_before_alert_minutes", 15)) * 60)
             window_sec = max(60, int(settings.get("alert_window_minutes", 15)) * 60)
@@ -282,113 +259,72 @@ class VoiceAlertCog(commands.Cog):
             now = now_ts()
             voice_alerts = db.load("voice_alerts")
 
-            # DEBUG: log tick khi có entries + hiện settings hiện tại để verify
-            if voice_alerts:
-                log.info(
-                    f"[voice_alerts tick] Track {len(voice_alerts)} CTV | "
-                    f"CONFIG: delay={delay_sec}s ({delay_sec//60}p), "
-                    f"window={window_sec}s ({window_sec//60}p), "
-                    f"count={count} lần, "
-                    f"interval={interval_sec:.0f}s ({interval_sec/60:.1f}p mỗi lần)"
-                )
-
-            to_update: dict[str, int] = {}
-            to_remove: list[str] = []
+            to_update: dict[str, tuple[float, int]] = {}
+            to_remove: dict[str, float | None] = {}
             to_disconnect: list[tuple[str, str, float]] = []
-            to_alert: list[tuple[str, str, int]] = []
+            to_alert: list[tuple[str, str, int, float]] = []
 
             for uid, info in voice_alerts.items():
-                joined_ts = info.get("joined_ts", 0)
-                channel_id = info.get("channel_id")
-                alerts_sent = info.get("alerts_sent", 0)
-
-                if not channel_id:
-                    to_remove.append(uid)
+                if not isinstance(info, dict):
+                    to_remove[uid] = None
                     continue
+                joined_ts = float(info.get("joined_ts", 0))
+                channel_id = info.get("channel_id")
 
-                # Option C: nếu giữa chừng có ai bật live trong kênh này → hủy tracking
-                if state.channel_has_stream(channel_id):
-                    log.info(
-                        f"[tick] user={uid}: kênh {channel_id} vừa có người live "
-                        f"→ hủy tracking (CTV này chỉ đang xem)"
-                    )
-                    to_remove.append(uid)
+                if info.get("paused_ts"):
+                    if now - float(info["paused_ts"]) > GRACE_SECONDS:
+                        to_remove[uid] = joined_ts
+                    continue
+                if not channel_id:
+                    to_remove[uid] = joined_ts
                     continue
 
                 time_in_voice = now - joined_ts
-
-                # DEBUG: log status của mỗi user
-                if time_in_voice >= delay_sec:
-                    time_in_window = time_in_voice - delay_sec
-                    if time_in_window >= window_sec:
-                        expected = count  # đã hết window
-                    else:
-                        expected = min(int(time_in_window / interval_sec) + 1, count)
-                    log.info(
-                        f"[tick] user={uid}: in_voice={int(time_in_voice)}s, "
-                        f"in_window={int(time_in_window)}s, sent={alerts_sent}, "
-                        f"expected={expected}, will_alert={alerts_sent < expected and time_in_window < window_sec}"
-                    )
-                else:
-                    log.info(
-                        f"[tick] user={uid}: in_voice={int(time_in_voice)}s "
-                        f"(chờ delay {delay_sec}s)"
-                    )
-
-                # Chưa hết delay
                 if time_in_voice < delay_sec:
                     continue
 
                 time_in_window = time_in_voice - delay_sec
-
-                # Đã hết window → cần disconnect
                 if time_in_window >= window_sec:
-                    log.info(f"[tick] user={uid} HẾT WINDOW → queue disconnect")
                     to_disconnect.append((uid, channel_id, joined_ts))
-                    to_remove.append(uid)
+                    to_remove[uid] = joined_ts
                     continue
 
-                # Tính số alert cần phát
+                # Lượt nhắc hiện tại (không phát bù các lượt đã lỡ)
                 expected = min(int(time_in_window / interval_sec) + 1, count)
+                if int(info.get("alerts_sent", 0)) < expected:
+                    to_alert.append((uid, channel_id, expected, joined_ts))
+                    to_update[uid] = (joined_ts, expected)
 
-                if alerts_sent < expected:
-                    next_count = alerts_sent + 1
-                    to_alert.append((uid, channel_id, next_count))
-                    to_update[uid] = next_count
-                    log.info(
-                        f"[voice_alerts] Queue alert #{next_count}/{count} cho user {uid} "
-                        f"(in_voice={int(time_in_voice)}s, in_window={int(time_in_window)}s)"
-                    )
+            if voice_alerts:
+                log.debug(
+                    f"[voice_alerts tick] {len(voice_alerts)} đồng hồ | delay={delay_sec}s "
+                    f"window={window_sec}s count={count} | nhắc={len(to_alert)} ngắt={len(to_disconnect)}"
+                )
 
-            # Apply state changes
             if to_update or to_remove:
                 def _apply(data):
-                    for uid, c in to_update.items():
-                        if uid in data:
-                            data[uid]["alerts_sent"] = c
-                    for uid in to_remove:
-                        data.pop(uid, None)
+                    for uid, (joined, c) in to_update.items():
+                        e = data.get(uid)
+                        if isinstance(e, dict) and _same_ts(e.get("joined_ts"), joined) and not e.get("paused_ts"):
+                            e["alerts_sent"] = c
+                    for uid, joined in to_remove.items():
+                        e = data.get(uid)
+                        if joined is None or (isinstance(e, dict) and _same_ts(e.get("joined_ts"), joined)):
+                            data.pop(uid, None)
 
                 await db.aupdate("voice_alerts", _apply)
 
-            # Play alerts (không block loop — spawn task)
-            for uid, cid, next_count in to_alert:
-                asyncio.create_task(
-                    self._play_alert(uid, cid, message, voice, next_count, count, alert_volume)
-                )
-
-            # Disconnect (spawn task)
-            for uid, cid, joined_ts in to_disconnect:
-                asyncio.create_task(self._disconnect_ctv(uid, cid, joined_ts))
+            for uid, cid, n, joined in to_alert:
+                self._spawn(self._play_alert(uid, cid, message, voice, n, count, alert_volume, joined))
+            for uid, cid, joined in to_disconnect:
+                self._spawn(self._disconnect_ctv(uid, cid, joined))
 
         except Exception:
             log.exception("[TASK] check_voice_alerts lỗi")
 
     @check_voice_alerts.error
     async def _check_voice_alerts_error(self, error):
-        """Nếu task loop crash → log để biết + restart task."""
         log.exception(f"[TASK] check_voice_alerts CRASH: {error}")
-        # Restart task
         try:
             self.check_voice_alerts.restart()
             log.info("[TASK] check_voice_alerts đã restart")
@@ -400,7 +336,31 @@ class VoiceAlertCog(commands.Cog):
         await self.bot.wait_until_ready()
 
     # =====================================================
-    #  PLAY ALERT — TTS vào voice channel
+    #  KIỂM TRA LẠI TRƯỚC KHI NHẮC / NGẮT
+    # =====================================================
+    def _still_tracking(self, user_id: str, channel_id: str):
+        """Trả về (channel, member) nếu CTV vẫn đang ngồi đúng kênh mà không live."""
+        channel = self.bot.get_channel(int(channel_id))
+        if channel is None:
+            return None, None
+        member = channel.guild.get_member(int(user_id))
+        if member is None:
+            return channel, None
+        status, cid = classify(member, db.load("ctv"))
+        if status != STATUS_TRACK or cid != str(channel.id):
+            return channel, None
+        return channel, member
+
+    async def _revert_alert_count(self, user_id: str, joined_ts: float, count: int) -> None:
+        def _rv(data):
+            e = data.get(user_id)
+            if isinstance(e, dict) and _same_ts(e.get("joined_ts"), joined_ts) and int(e.get("alerts_sent", 0)) >= count:
+                e["alerts_sent"] = count - 1
+
+        await db.aupdate("voice_alerts", _rv)
+
+    # =====================================================
+    #  PHÁT NHẮC
     # =====================================================
     async def _play_alert(
         self,
@@ -408,164 +368,90 @@ class VoiceAlertCog(commands.Cog):
         channel_id: str,
         message: str,
         voice: str,
-        count: int = 1,
-        total: int = 1,
-        volume: float = 1.0,
+        count: int,
+        total: int,
+        volume: float,
+        joined_ts: float,
     ):
         try:
-            channel = self.bot.get_channel(int(channel_id))
-            if not isinstance(channel, discord.VoiceChannel):
-                log.warning(f"Kênh {channel_id} không phải VoiceChannel, remove entry")
-                await self._remove_entry(user_id)
+            channel, member = self._still_tracking(user_id, channel_id)
+            if member is None:
+                log.info(f"[voice_alerts] Bỏ lượt nhắc #{count} cho {user_id}: không còn ngồi chờ ở kênh {channel_id}")
                 return
 
-            # Verify CTV — CHỈ remove entry khi có EVIDENCE RÕ RÀNG
-            # (voice state null có thể do Discord cache delay tạm thời, không nên remove)
-            member = channel.guild.get_member(int(user_id))
-            if not member:
-                log.warning(f"Member {user_id} chưa có trong cache, skip alert (GIỮ entry để retry)")
-                return
-            if not member.voice or not member.voice.channel:
-                log.warning(
-                    f"CTV {user_id} voice state null (có thể do Discord delay), "
-                    f"skip alert #{count}/{total} — GIỮ entry"
-                )
-                return
-            # Đã chuyển kênh KHÁC → remove entry (evidence rõ ràng)
-            if member.voice.channel.id != channel.id:
-                log.info(f"CTV {user_id} đã chuyển kênh khác, remove entry")
-                await self._remove_entry(user_id)
-                return
-            # Đã bật Live → remove entry (evidence rõ ràng)
-            if member.voice.self_stream:
-                log.info(f"CTV {user_id} đã bật Live, remove entry")
-                await self._remove_entry(user_id)
+            personalized = message.replace("{ten_ctv}", member.display_name)
+            audio_path = await generate_tts_file(personalized, voice=voice)
+            if not audio_path:
+                # Tạo giọng đọc lỗi → không tính lượt này, lần kiểm tra sau thử lại
+                await self._revert_alert_count(user_id, joined_ts, count)
+                log.warning(f"Tạo giọng đọc lỗi cho lượt nhắc #{count} của {member.display_name}, sẽ thử lại")
                 return
 
-            # Lock để tránh 2 alert cùng lúc trên 1 guild
-            lock = self._get_play_lock(channel.guild.id)
-            async with lock:
-                # Generate TTS
-                personalized = message.replace("{ten_ctv}", member.display_name)
-                log.info(
-                    f"[voice_alerts] Bắt đầu phát alert #{count}/{total} cho "
-                    f"{member.display_name} tại #{channel.name}"
-                )
-                audio_path = await generate_tts_file(personalized, voice=voice)
-                if not audio_path:
-                    log.warning(f"Generate TTS fail cho alert #{count}, skip")
-                    return
-
-                # Play với volume
+            try:
                 success = await play_audio_in_channel(channel, audio_path, volume=volume)
-
-                # Cleanup
+            finally:
                 cleanup_tts_file(audio_path)
 
-                if success:
-                    log.info(
-                        f"🔊 Đã phát alert #{count}/{total} cho CTV "
-                        f"{member.display_name} tại #{channel.name}"
-                    )
-                else:
-                    log.warning(
-                        f"❌ Play alert #{count}/{total} FAIL cho {member.display_name} — "
-                        f"có thể do voice gateway hoặc FFmpeg"
-                    )
-
+            if success:
+                log.info(f"🔊 Đã phát nhắc #{count}/{total} cho CTV {member.display_name} tại #{channel.name}")
+            else:
+                log.warning(
+                    f"❌ Phát nhắc #{count}/{total} lỗi cho {member.display_name} — "
+                    "kiểm tra quyền Connect/Speak của bot và FFmpeg"
+                )
         except Exception:
             log.exception(f"_play_alert cho user {user_id} lỗi")
 
-    async def _remove_entry(self, user_id: str) -> None:
-        """Xóa entry khỏi voice_alerts (dùng khi detect state cũ)."""
-        def _rm(data):
-            data.pop(user_id, None)
-
-        try:
-            await db.aupdate("voice_alerts", _rm)
-        except Exception:
-            log.exception(f"Remove voice_alerts entry {user_id} lỗi")
-
     # =====================================================
-    #  DISCONNECT CTV + LOG
+    #  NGẮT KẾT NỐI + LOG
     # =====================================================
     async def _disconnect_ctv(self, user_id: str, channel_id: str, joined_ts: float):
         try:
-            channel = self.bot.get_channel(int(channel_id))
-            if not channel:
+            channel, member = self._still_tracking(user_id, channel_id)
+            if member is None:
+                log.info(f"CTV {user_id} không còn ngồi chờ ở kênh {channel_id} → không ngắt")
                 return
 
-            member = channel.guild.get_member(int(user_id))
-            if not member:
-                log.warning(f"Không tìm thấy member {user_id} để kick, skip")
+            if not await kick_from_voice(member):
                 return
 
-            # Nếu voice state null → có thể Discord cache delay, retry sau 2 giây
-            if not member.voice or not member.voice.channel:
-                log.info(f"CTV {user_id} voice state null, retry sau 2s")
-                await asyncio.sleep(2)
-                # Re-fetch member để có state mới nhất
-                member = channel.guild.get_member(int(user_id))
-                if not member or not member.voice or not member.voice.channel:
-                    log.info(f"CTV {user_id} đã rời voice thực sự, skip kick")
-                    return
-
-            if member.voice.channel.id != channel.id:
-                log.info(f"CTV {user_id} đã chuyển kênh, không kick")
-                return
-            if member.voice.self_stream:
-                log.info(f"CTV {user_id} vừa bật Live, không kick")
-                return
-
-            success = await kick_from_voice(member)
-            if not success:
-                return
-
-            log.warning(f"🚪 Đã kick CTV {member.display_name} khỏi #{channel.name} (quá hạn không live)")
-
-            # Log vào kênh log
-            await self._log_disconnect(user_id, channel_id, joined_ts)
-
+            log.warning(f"🚪 Đã ngắt CTV {member.display_name} khỏi #{channel.name} (quá hạn không live)")
+            await self._log_disconnect(user_id, channel, joined_ts)
         except Exception:
             log.exception(f"_disconnect_ctv cho user {user_id} lỗi")
 
-    async def _log_disconnect(self, user_id: str, channel_id: str, joined_ts: float):
+    async def _log_disconnect(self, user_id: str, channel, joined_ts: float):
         settings = db.load("voice_settings")
-        log_ch_id = settings.get("log_channel_id", 0)
+        # Chưa cài kênh log riêng → gửi về kênh báo CTV đi trễ
+        log_ch_id = settings.get("log_channel_id", 0) or LATE_ALERT_CHANNEL_ID
         if not log_ch_id:
             return
-
         log_channel = self.bot.get_channel(int(log_ch_id))
         if not log_channel:
-            log.warning(f"Không tìm thấy log channel {log_ch_id}")
+            log.warning(f"Không tìm thấy kênh log {log_ch_id}")
             return
 
         join_dt = from_ts(joined_ts)
         disconnect_dt = now_vn()
         duration_sec = (disconnect_dt - join_dt).total_seconds()
 
-        channels_data = db.load("channels")
-        c_name = channels_data.get(str(channel_id), {}).get("name", f"Kênh {channel_id}")
-
         embed = discord.Embed(
             title="🚪 CTV Bị Ngắt Kết Nối",
-            description=(
-                f"CTV vào voice channel nhưng không bật Go Live trong thời gian quy định.\n\u200b"
-            ),
+            description="CTV ở trong voice nhưng không bật Go Live trong thời gian quy định.\n​",
             color=discord.Color.red(),
         )
         embed.add_field(name="👤 CTV", value=f"<@{user_id}>", inline=True)
-        embed.add_field(name="📺 Kênh", value=c_name, inline=True)
-        embed.add_field(name="\u200b", value="\u200b", inline=True)  # spacer
-        embed.add_field(name="🕐 Vào kênh lúc", value=f"`{fmt_full(join_dt)}`", inline=True)
-        embed.add_field(name="⏱️ Ở trong voice", value=f"`{fmt_dur(duration_sec)}`", inline=True)
+        embed.add_field(name="📺 Kênh", value=channel.name, inline=True)
+        embed.add_field(name="​", value="​", inline=True)
+        embed.add_field(name="🕐 Bắt đầu tính giờ", value=f"`{fmt_full(join_dt)}`", inline=True)
+        embed.add_field(name="⏱️ Không live trong", value=f"`{fmt_dur(duration_sec)}`", inline=True)
         embed.add_field(name="🚪 Bị ngắt lúc", value=f"`{fmt_full(disconnect_dt)}`", inline=True)
-        embed.set_footer(text="Voice Alert System | Không phải phiên live")
+        embed.set_footer(text="Voice Alert | Thời gian audio vẫn được ghi trong Check CTV")
 
         try:
             await log_channel.send(embed=embed)
         except Exception:
-            log.exception("Gửi log disconnect lỗi")
+            log.exception("Gửi log ngắt kết nối lỗi")
 
 
 async def setup(bot: commands.Bot):

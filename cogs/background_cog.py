@@ -78,65 +78,67 @@ class BackgroundCog(commands.Cog):
     # =====================================================
     @tasks.loop(minutes=1)
     async def check_reminders(self):
+        """
+        Lịch live gắn theo từng CTV: {user_id: {time, time_str, channel_id, reminders_sent}}.
+
+        - CTV đang live ở BẤT KỲ kênh nào → hủy lịch.
+        - Đến giờ: nhắc mỗi REMINDER_INTERVAL_MINUTES phút, tối đa LATE_REMINDER_MAX lần.
+        - Quá hạn → báo admin 1 lần rồi hủy lịch.
+        - Bot offline lâu rồi bật lại: không gửi dồn — nhảy thẳng tới lượt nhắc hiện tại,
+          hoặc báo trễ luôn nếu đã quá hạn.
+        """
         try:
             nl_data = db.load("next_live")
             if not nl_data:
                 return
 
             now_ts = now_vn().timestamp()
-            to_update: dict[str, int] = {}
-            to_delete: list[str] = []
+            to_update: dict[str, tuple[float, int]] = {}
+            to_delete: dict[str, float | None] = {}   # uid → time đã đọc (để không xóa nhầm lịch mới)
 
-            for cid_str, info in nl_data.items():
+            for uid, info in nl_data.items():
                 if not isinstance(info, dict):
                     continue
 
-                # Đã live → không cần nhắc nữa
-                if state.channel_has_stream(cid_str):
-                    to_delete.append(cid_str)
-                    continue
-
                 target_ts = info.get("time")
-                user_id = info.get("user_id")
-                reminders_sent = info.get("reminders_sent", 0)
+                channel_id = str(info.get("channel_id", ""))
 
-                if not target_ts or not user_id:
+                # Đã live → không cần nhắc nữa
+                if state.is_streaming(uid):
+                    to_delete[uid] = target_ts
                     continue
 
-                # Chưa tới giờ
+                if not target_ts or not channel_id:
+                    continue
                 if now_ts < target_ts:
+                    continue  # Chưa tới giờ
+
+                reminders_sent = int(info.get("reminders_sent", 0))
+                minutes_late = int((now_ts - target_ts) / 60)
+                expected = minutes_late // REMINDER_INTERVAL_MINUTES + 1
+
+                if expected > LATE_REMINDER_MAX:
+                    # Quá hạn → báo admin 1 lần và hủy
+                    await self._send_late_alert(channel_id, uid, info.get("time_str", "?"))
+                    to_delete[uid] = target_ts
                     continue
 
-                minutes_late = int((now_ts - target_ts) / 60)
-                expected = min(
-                    minutes_late // REMINDER_INTERVAL_MINUTES + 1,
-                    LATE_REMINDER_MAX + 1,
-                )
-
-                # Chưa cần gửi thêm reminder
                 if reminders_sent >= expected:
                     continue
 
-                # Đã gửi đủ max → alert admin và bỏ
-                if reminders_sent >= LATE_REMINDER_MAX:
-                    await self._send_late_alert(cid_str, user_id, info.get("time_str", "?"))
-                    to_delete.append(cid_str)
-                    continue
+                # Chỉ gửi 1 tin cho lượt hiện tại (không gửi bù các lượt đã lỡ)
+                await self._send_reminder(channel_id, uid, info.get("time_str", "?"), expected)
+                to_update[uid] = (target_ts, expected)
 
-                # Gửi reminder
-                await self._send_reminder(
-                    cid_str, user_id, info.get("time_str", "?"), reminders_sent + 1
-                )
-                to_update[cid_str] = reminders_sent + 1
-
-            # Persist thay đổi
             if to_update or to_delete:
                 def _apply(data):
-                    for cid, new_count in to_update.items():
-                        if cid in data and isinstance(data[cid], dict):
-                            data[cid]["reminders_sent"] = new_count
-                    for cid in to_delete:
-                        data.pop(cid, None)
+                    for uid, (t, count) in to_update.items():
+                        if isinstance(data.get(uid), dict) and data[uid].get("time") == t:
+                            data[uid]["reminders_sent"] = count
+                    for uid, t in to_delete.items():
+                        # CTV vừa đặt lịch mới trong lúc đang xử lý → giữ lịch mới
+                        if isinstance(data.get(uid), dict) and data[uid].get("time") == t:
+                            data.pop(uid, None)
 
                 await db.aupdate("next_live", _apply)
         except Exception:
@@ -167,7 +169,7 @@ class BackgroundCog(commands.Cog):
             )
             view = ReminderView(channel_id, GUILD_ID)
             await user.send(embed=embed, view=view)
-            log.info(f"Nhắc live CTV {user_id} kênh {channel_id} (lần {count}/{LATE_REMINDER_MAX})")
+            log.info(f"Nhắc live CTV {user_id} (lần {count}/{LATE_REMINDER_MAX})")
         except (discord.Forbidden, discord.HTTPException) as e:
             log.warning(f"Không DM được CTV {user_id}: {e}")
         except Exception:
@@ -186,10 +188,11 @@ class BackgroundCog(commands.Cog):
             embed = discord.Embed(
                 title="🚨 CTV ĐI TRỄ",
                 description=(
-                    f"CTV <@{user_id}> đã quá hạn Live kênh **{channel_name}**.\n"
+                    f"CTV <@{user_id}> đã quá hạn Live (kênh **{channel_name}**) "
+                    "và hiện không live ở kênh nào.\n"
                     f"Lịch: **{time_str}**\n"
-                    f"Bot đã nhắc **{LATE_REMINDER_MAX}** lần cách nhau "
-                    f"{REMINDER_INTERVAL_MINUTES} phút nhưng không thấy vào."
+                    f"Đã quá **{LATE_REMINDER_MAX * REMINDER_INTERVAL_MINUTES} phút** so với lịch "
+                    f"(bot nhắc mỗi {REMINDER_INTERVAL_MINUTES} phút) mà vẫn chưa live."
                 ),
                 color=discord.Color.red(),
             )

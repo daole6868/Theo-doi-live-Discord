@@ -106,6 +106,13 @@ HEARTBEAT_SECONDS = 30            # Bot ghi "vẫn đang chạy" mỗi 30 giây
 RECONCILE_MINUTES = 5             # Định kỳ đối chiếu trạng thái với Discord
 LEGACY_LIVE_MAX_HOURS = 24        # Lần đầu nâng cấp: chỉ giữ phiên cũ nếu bắt đầu < 24h trước
 
+# Thông báo & nhắc lịch
+NOTIFY_COOLDOWN_MINUTES = 30            # Mỗi CTV báo live cho khách tối đa 1 lần / 30 phút
+NEXT_LIVE_PROMPT_DELAY_SECONDS = 120    # Tắt live 2 phút (không bật lại) mới hỏi giờ live tiếp theo
+
+# Voice Alert
+VOICE_ALERT_REJOIN_GRACE_MINUTES = 5    # Rời rồi vào lại trong 5 phút → giữ đồng hồ cũ
+
 # Loại phiên
 KIND_STREAM = "stream"            # Bật Go Live (chia sẻ màn hình) — chỉ loại này tính là LIVE
 KIND_AUDIO = "audio"              # Ở trong kênh voice nhưng không chia sẻ màn hình

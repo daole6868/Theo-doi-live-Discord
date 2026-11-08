@@ -139,7 +139,7 @@ def build_settings_preview() -> discord.Embed:
 
     embed.add_field(
         name="📤 Kênh log disconnect",
-        value=f"<#{log_ch}>" if log_ch else "*(chưa cài đặt)*",
+        value=f"<#{log_ch}>" if log_ch else "*(chưa cài — dùng kênh báo CTV đi trễ)*",
         inline=False,
     )
 
