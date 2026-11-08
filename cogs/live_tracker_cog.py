@@ -9,7 +9,8 @@ Live Tracker Cog — tính giờ LIVE (chia sẻ màn hình) và AUDIO cho từn
 - Nhịp tim mỗi 30 giây.
 
 Khi CTV bắt đầu LIVE (ở bất kỳ kênh nào): hủy lịch nhắc của chính CTV đó và báo
-cho khách đăng ký các kênh CTV đó quản lý (mỗi CTV tối đa 1 lần / 30 phút).
+ngay cho khách đăng ký các kênh CTV đó quản lý (giới hạn tần suất bằng
+NOTIFY_COOLDOWN_MINUTES trong config.py, mặc định 0 = báo mỗi lần bật live).
 Khi CTV tắt LIVE: chờ 2 phút, nếu không bật lại thì DM hỏi giờ live tiếp theo.
 """
 import asyncio
@@ -253,7 +254,7 @@ class LiveTrackerCog(commands.Cog):
         await db.aupdate("next_live", _remove_next)
 
         last = self._last_notified.get(c.user_id)
-        if last is not None and c.start_ts - last < NOTIFY_COOLDOWN_MINUTES * 60:
+        if NOTIFY_COOLDOWN_MINUTES > 0 and last is not None and c.start_ts - last < NOTIFY_COOLDOWN_MINUTES * 60:
             log.info(f"⏭️ Bỏ qua DM báo live cho khách của {c.user_id} (đã báo trong {NOTIFY_COOLDOWN_MINUTES} phút)")
             return
 

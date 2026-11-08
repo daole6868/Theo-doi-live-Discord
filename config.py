@@ -110,7 +110,7 @@ RECONCILE_MINUTES = 5             # Định kỳ đối chiếu trạng thái v�
 LEGACY_LIVE_MAX_HOURS = 24        # Lần đầu nâng cấp: chỉ giữ phiên cũ nếu bắt đầu < 24h trước
 
 # Thông báo & nhắc lịch
-NOTIFY_COOLDOWN_MINUTES = 30            # Mỗi CTV báo live cho khách tối đa 1 lần / 30 phút
+NOTIFY_COOLDOWN_MINUTES = 0             # 0 = báo ngay mỗi lần CTV bật live. Đặt số phút > 0 để giới hạn
 NEXT_LIVE_PROMPT_DELAY_SECONDS = 120    # Tắt live 2 phút (không bật lại) mới hỏi giờ live tiếp theo
 
 # Voice Alert

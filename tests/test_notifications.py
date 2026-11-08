@@ -86,13 +86,22 @@ class LiveNotifyTests(unittest.IsolatedAsyncioTestCase):
         await self.cog.on_voice_state_update(self.m1, off, voice(self.k2, True))  # CTV1 live ở kênh CTV2
         self.assertEqual(list(db.load("next_live")), ["2"])
 
-    async def test_cooldown_and_prompt(self):
+    async def _stream_off_on(self):
         off = NS(channel=None, self_stream=False)
         await self.cog.on_voice_state_update(self.m1, off, voice(self.k2, True))
         await self.cog.on_voice_state_update(self.m1, voice(self.k2, True), voice(self.k2, False))
         self.assertIn("1", self.cog._pending_prompts)          # hẹn hỏi giờ live sau 2 phút
         await self.cog.on_voice_state_update(self.m1, voice(self.k2, False), voice(self.k2, True))
         self.assertNotIn("1", self.cog._pending_prompts)       # bật lại → hủy hỏi
+
+    async def test_default_notifies_every_time(self):
+        """Mặc định (0 phút): CTV bật live lại → khách được báo lại ngay."""
+        await self._stream_off_on()
+        self.assertEqual(self.cog._notify_subscribers.await_count, 2)
+
+    async def test_cooldown_when_configured(self):
+        with mock.patch.object(live_tracker_cog, "NOTIFY_COOLDOWN_MINUTES", 30):
+            await self._stream_off_on()
         self.assertEqual(self.cog._notify_subscribers.await_count, 1)  # không DM khách lần 2
 
 
