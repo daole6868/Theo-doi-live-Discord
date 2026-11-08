@@ -4,7 +4,7 @@ Broadcast View — flow "Gửi Voice" cho Admin.
 Admin bấm nút "📢 Gửi Voice" ở admin panel → mở view có:
 - 📝 Nội dung  — modal nhập text
 - 🔊 Âm lượng  — modal nhập %
-- Dropdown chọn kênh voice
+- Menu chọn kênh đã lưu
 - 🚀 Gửi ngay   — bot vào kênh + phát TTS
 - 💾 Lưu cấu hình — lưu nội dung + âm lượng (KHÔNG lưu kênh)
 - ❌ Hủy
@@ -24,6 +24,7 @@ from helpers.tts import (
     DEFAULT_VOICE_FEMALE,
 )
 from helpers.voice_manager import play_audio_in_channel
+from views.select_utils import add_select_groups, channel_options
 
 log = logging.getLogger(__name__)
 
@@ -157,31 +158,21 @@ class EditBroadcastVolumeModal(ui.Modal, title="Chỉnh Âm Lượng Phát"):
 # =========================================================
 #  SELECT: Chọn kênh voice
 # =========================================================
-class BroadcastChannelSelect(ui.ChannelSelect):
-    """Chọn kênh voice để phát (gõ để tìm, mọi kênh voice trong server)."""
-
-    def __init__(self, state: BroadcastState, view: "BroadcastView"):
-        self.state = state
-        self.view_ref = view
-        super().__init__(
-            placeholder="🎯 Gõ tên kênh voice để phát...",
-            channel_types=[discord.ChannelType.voice],
-            min_values=1,
-            max_values=1,
-            row=2,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        self.state.channel_id = self.values[0].id
-        log.info(f"Admin {interaction.user} chọn kênh broadcast = {self.state.channel_id}")
-
+def _make_channel_picker(state: "BroadcastState", view: "BroadcastView"):
+    async def _on_pick(interaction: discord.Interaction, cid: str) -> None:
+        if cid == "none":
+            await interaction.response.send_message("Chưa có kênh nào trong hệ thống.", ephemeral=True)
+            return
+        state.channel_id = int(cid)
+        log.info(f"Admin {interaction.user} chọn kênh broadcast = {cid}")
         try:
             await interaction.response.edit_message(
-                embed=build_broadcast_preview(self.state),
-                view=self.view_ref,
+                embed=build_broadcast_preview(state),
+                view=view,
             )
         except Exception:
             log.exception("Refresh broadcast preview lỗi")
+    return _on_pick
 
 
 # =========================================================
@@ -209,7 +200,7 @@ class EditVolumeButton(ui.Button):
 
 class SendNowButton(ui.Button):
     def __init__(self, state: BroadcastState):
-        super().__init__(label="🚀 Gửi ngay", style=discord.ButtonStyle.success, row=3)
+        super().__init__(label="🚀 Gửi ngay", style=discord.ButtonStyle.success, row=4)
         self.state = state
 
     async def callback(self, interaction: discord.Interaction):
@@ -279,7 +270,7 @@ class SendNowButton(ui.Button):
 
 class SaveConfigButton(ui.Button):
     def __init__(self, state: BroadcastState):
-        super().__init__(label="💾 Lưu cấu hình", style=discord.ButtonStyle.primary, row=3)
+        super().__init__(label="💾 Lưu cấu hình", style=discord.ButtonStyle.primary, row=4)
         self.state = state
 
     async def callback(self, interaction: discord.Interaction):
@@ -303,7 +294,7 @@ class SaveConfigButton(ui.Button):
 
 class CancelButton(ui.Button):
     def __init__(self):
-        super().__init__(label="❌ Hủy", style=discord.ButtonStyle.danger, row=3)
+        super().__init__(label="❌ Hủy", style=discord.ButtonStyle.danger, row=4)
 
     async def callback(self, interaction: discord.Interaction):
         try:
@@ -328,10 +319,14 @@ class BroadcastView(ui.View):
         self.add_item(EditMessageButton(self.state, self))
         self.add_item(EditVolumeButton(self.state, self))
 
-        # Row 2: Dropdown chọn kênh (chiếm full row)
-        self.add_item(BroadcastChannelSelect(self.state, self))
+        # Row 1-3: menu chọn kênh đã lưu (tối đa 3 menu = 75 kênh, chừa hàng nút)
+        add_select_groups(
+            self, channel_options(), "🎯 Chọn kênh voice để phát...",
+            _make_channel_picker(self.state, self), start_row=1, max_selects=3,
+            empty_label="Chưa có kênh nào",
+        )
 
-        # Row 3: 3 nút action
+        # Row 4: 3 nút action
         self.add_item(SendNowButton(self.state))
         self.add_item(SaveConfigButton(self.state))
         self.add_item(CancelButton())

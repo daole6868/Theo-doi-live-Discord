@@ -2,8 +2,8 @@
 Dashboard check thời gian live của CTV.
 
 UX mới:
-- Chọn CTV bằng ô chọn thành viên (gõ tên) → default HÔM NAY (chi tiết phiên hôm nay).
-  Xem được cả người đã nghỉ (lịch sử vẫn giữ).
+- Chọn CTV từ menu (danh sách CTV đã lưu, kèm người đã nghỉ còn lịch sử)
+  → default HÔM NAY (chi tiết phiên hôm nay). Hơn 25 CTV → tự chia nhiều menu.
 - Bấm "7 ngày" hoặc "15 ngày" → summary theo ngày + nút mỗi ngày để drill-down.
 - Bấm 1 nút ngày cụ thể → chi tiết phiên của ngày đó.
 """
@@ -15,6 +15,7 @@ from discord import ui
 
 from config import CHECK_RANGE_OPTIONS
 from helpers.stats import create_ctv_report
+from views.select_utils import MAX_SELECTS, add_select_groups, ctv_options
 from helpers.time_utils import now_vn
 
 log = logging.getLogger(__name__)
@@ -116,41 +117,51 @@ class CheckCTVDetailView(ui.View):
 
 
 # =========================================================
-#  CHECK CTV — ô chọn thành viên (persistent, gõ tên để tìm)
+#  CHECK CTV — menu liệt kê CTV đã lưu (persistent)
 # =========================================================
-class CheckCTVSelect(ui.UserSelect):
-    def __init__(self):
-        super().__init__(
-            placeholder="Gõ tên CTV để xem thời gian live...",
-            min_values=1,
-            max_values=1,
-            custom_id="check_ctv_user_select",
+# Menu đầu giữ custom_id cũ để panel gửi từ bản trước vẫn bấm được.
+CHECK_SELECT_IDS = ["check_ctv_select"] + [f"check_ctv_select_{i}" for i in range(2, MAX_SELECTS + 1)]
+
+
+async def _on_pick_ctv(interaction: discord.Interaction, value: str) -> None:
+    if value == "none":
+        await interaction.response.send_message("Chưa có CTV nào trong hệ thống.", ephemeral=True)
+        return
+
+    member = interaction.guild.get_member(int(value)) if interaction.guild and value.isdigit() else None
+    display = f"{member.display_name} (`{value}`)" if member else f"CTV `{value}`"
+
+    embed = create_ctv_report(value, 1)  # Mặc định: HÔM NAY
+    if embed.title and embed.title.startswith("❌"):
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            content=f"📋 Đang xem: **{display}**",
+            embed=embed,
+            view=CheckCTVDetailView(value, current=1, selected_day=None),
+            ephemeral=True,
         )
 
-    async def callback(self, interaction: discord.Interaction):
-        picked = self.values[0]
-        value = str(picked.id)
-
-        embed = create_ctv_report(value, 1)  # Mặc định: HÔM NAY
-        if embed.title and embed.title.startswith("❌"):
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-        else:
-            view = CheckCTVDetailView(value, current=1, selected_day=None)
-            await interaction.response.send_message(
-                content=f"📋 Đang xem: **{picked.display_name}** (`{value}`)",
-                embed=embed,
-                view=view,
-                ephemeral=True,
-            )
-
-        # Bỏ lựa chọn cũ trên panel để người sau chọn lại được
-        try:
-            await interaction.message.edit(view=CheckCTVPanelView())
-        except Exception:
-            log.exception("Rebuild CheckCTV panel lỗi")
+    # Bỏ lựa chọn cũ trên panel để người sau chọn lại được (giữ tên CTV)
+    try:
+        await interaction.message.edit(view=CheckCTVPanelView(interaction.guild))
+    except Exception:
+        log.exception("Rebuild CheckCTV panel lỗi")
 
 
 class CheckCTVPanelView(ui.View):
-    def __init__(self):
+    """
+    guild: dùng để hiện tên CTV. Lúc bot khởi động (đăng ký persistent) chưa có
+    guild → nhãn tạm, không ảnh hưởng việc bấm chọn.
+    """
+
+    def __init__(self, guild=None):
         super().__init__(timeout=None)
-        self.add_item(CheckCTVSelect())
+        add_select_groups(
+            self,
+            ctv_options(guild),
+            "Chọn CTV để xem thời gian live...",
+            _on_pick_ctv,
+            custom_ids=CHECK_SELECT_IDS,
+            empty_label="Chưa có CTV nào",
+        )

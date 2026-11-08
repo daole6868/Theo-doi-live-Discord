@@ -153,6 +153,11 @@ class SessionStore:
             ).fetchone()
         return row is not None
 
+    def user_ids(self) -> list[str]:
+        """Mọi người từng có lịch sử."""
+        with self._lock:
+            return [r[0] for r in self._conn.execute("SELECT DISTINCT user_id FROM sessions").fetchall()]
+
     def count(self) -> int:
         with self._lock:
             return self._conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]

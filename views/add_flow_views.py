@@ -8,7 +8,7 @@ THÊM KÊNH:
 4. Bot tạo/thêm theo chế độ -> auto-refresh user panel
 
 THÊM CTV (ephemeral tại kênh admin):
-1. Admin bấm "Thêm CTV" -> ô chọn kênh (gõ để tìm)
+1. Admin bấm "Thêm CTV" -> menu kênh đã lưu
 2. Chọn kênh -> ô chọn thành viên (gõ tên để tìm)
 3. Chọn thành viên -> add CTV (chỉ gán role nếu kênh Riêng tư)
 """
@@ -21,6 +21,7 @@ from config import TARGET_CATEGORY_ID
 from core.data_manager import db
 from helpers.panels import refresh_panel, resync_tracking
 from helpers.permissions import deny_if_not_admin
+from views.select_utils import add_select_groups, channel_options
 
 log = logging.getLogger(__name__)
 
@@ -298,8 +299,9 @@ class AddChannelChoiceView(ui.View):
 
 # =========================================================
 #  FLOW THÊM CTV
-#  Bước 1: chọn kênh (ô chọn kênh của Discord — gõ để tìm, không giới hạn 25)
-#  Bước 2: chọn thành viên (ô chọn thành viên của Discord — gõ tên để tìm)
+#  Bước 1: chọn kênh trong danh sách kênh đã lưu
+#  Bước 2: chọn thành viên server (ô chọn thành viên của Discord — gõ tên để tìm,
+#          vì người này chưa có trong hệ thống)
 # =========================================================
 async def add_ctv_to_channel(
     interaction: discord.Interaction,
@@ -384,40 +386,34 @@ class AddCTVForChannelView(ui.View):
         self.add_item(AddCTVMemberSelect(channel_id))
 
 
-class AddCTVChannelSelect(ui.ChannelSelect):
-    """Bước 1: chọn kênh (chỉ kênh đã thêm vào hệ thống)."""
-
-    def __init__(self):
-        super().__init__(
-            placeholder="Gõ tên kênh voice để thêm CTV...",
-            channel_types=[discord.ChannelType.voice],
-            min_values=1,
-            max_values=1,
+async def _on_pick_channel_for_ctv(interaction: discord.Interaction, cid_str: str) -> None:
+    channels = db.load("channels")
+    if cid_str == "none" or cid_str not in channels:
+        await interaction.response.send_message(
+            "⚠️ Chưa có kênh nào trong hệ thống. Hãy **➕ Thêm Kênh** trước.",
+            ephemeral=True,
         )
+        return
 
-    async def callback(self, interaction: discord.Interaction):
-        cid_str = str(self.values[0].id)
-        channels = db.load("channels")
-        if cid_str not in channels:
-            await interaction.response.send_message(
-                "⚠️ Kênh này chưa có trong hệ thống. Hãy **➕ Thêm Kênh** trước.",
-                ephemeral=True,
-            )
-            return
-
-        channel_name = channels[cid_str].get("name", "?")
-        embed = discord.Embed(
-            title=f"➕ Thêm CTV cho kênh {channel_name}",
-            description=(
-                f"**Bước 2/2:** Chọn thành viên làm CTV kênh **{channel_name}**.\n"
-                "Gõ tên vào ô bên dưới để tìm."
-            ),
-            color=discord.Color.green(),
-        )
-        await interaction.response.edit_message(embed=embed, view=AddCTVForChannelView(cid_str))
+    channel_name = channels[cid_str].get("name", "?")
+    embed = discord.Embed(
+        title=f"➕ Thêm CTV cho kênh {channel_name}",
+        description=(
+            f"**Bước 2/2:** Chọn thành viên làm CTV kênh **{channel_name}**.\n"
+            "Người này chưa có trong hệ thống nên chọn trong danh sách thành viên server "
+            "(gõ tên vào ô bên dưới để tìm)."
+        ),
+        color=discord.Color.green(),
+    )
+    await interaction.response.edit_message(embed=embed, view=AddCTVForChannelView(cid_str))
 
 
 class AddCTVChannelSelectView(ui.View):
+    """Bước 1: menu liệt kê các kênh đã lưu (hơn 25 kênh → nhiều menu)."""
+
     def __init__(self):
         super().__init__(timeout=300)
-        self.add_item(AddCTVChannelSelect())
+        add_select_groups(
+            self, channel_options(), "Chọn kênh để thêm CTV...",
+            _on_pick_channel_for_ctv, empty_label="Chưa có kênh nào",
+        )

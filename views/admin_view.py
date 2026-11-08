@@ -44,8 +44,8 @@ class AdminPanelView(ui.View):
         embed = discord.Embed(
             title="➕ Thêm CTV",
             description=(
-                "**Bước 1/2:** Chọn kênh mà bạn muốn thêm CTV (gõ tên để tìm).\n\n"
-                "Sau đó chọn thành viên làm CTV."
+                "**Bước 1/2:** Chọn kênh (trong danh sách kênh đã lưu) mà bạn muốn thêm CTV.\n\n"
+                "Sau đó chọn thành viên trong server làm CTV."
             ),
             color=discord.Color.green(),
         )
@@ -103,7 +103,7 @@ class AdminPanelView(ui.View):
         )
         await interaction.response.send_message(
             embed=embed,
-            view=ManageCTVSelectView(),
+            view=ManageCTVSelectView(interaction.guild),
             ephemeral=True,
         )
 

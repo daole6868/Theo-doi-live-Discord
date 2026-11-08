@@ -6,7 +6,7 @@ QUẢN LÝ KÊNH:
 - Xóa khỏi Bot (giữ voice channel + role Discord)
 - Xóa hoàn toàn (xóa cả voice channel + role Discord)
 
-QUẢN LÝ CTV (chọn bằng ô chọn thành viên của Discord — gõ tên để tìm):
+QUẢN LÝ CTV (chọn từ danh sách CTV đã lưu):
 - Bỏ khỏi 1 kênh cụ thể (thu hồi role của kênh đó)
 - Xóa hoàn toàn (bỏ khỏi tất cả kênh + thu hồi mọi role liên quan)
 - Xóa lịch sử live (cả với người đã nghỉ)
@@ -25,6 +25,7 @@ from core.data_manager import db
 from core.session_store import store
 from helpers import follows
 from helpers.panels import refresh_panel, resync_tracking
+from views.select_utils import add_select_groups, channel_options, ctv_options
 
 log = logging.getLogger(__name__)
 
@@ -61,59 +62,56 @@ class ConfirmView(ui.View):
 # =========================================================
 #  QUẢN LÝ KÊNH — dropdown chọn kênh
 # =========================================================
-class ManageChannelSelect(ui.ChannelSelect):
-    """Chọn kênh cần quản lý (gõ để tìm, không giới hạn 25)."""
-
-    def __init__(self):
-        super().__init__(
-            placeholder="Gõ tên kênh voice cần quản lý...",
-            channel_types=[discord.ChannelType.voice],
-            min_values=1,
-            max_values=1,
+async def show_manage_channel(interaction: discord.Interaction, cid: str) -> None:
+    """Hiện thông tin + các thao tác cho 1 kênh đã lưu."""
+    if cid == "none":
+        await interaction.response.send_message("Chưa có kênh nào.", ephemeral=True)
+        return
+    if cid not in db.load("channels"):
+        await interaction.response.send_message(
+            "⚠️ Kênh này không còn trong hệ thống bot.", ephemeral=True,
         )
+        return
 
-    async def callback(self, interaction: discord.Interaction):
-        cid = str(self.values[0].id)
-        if cid not in db.load("channels"):
-            await interaction.response.send_message(
-                "⚠️ Kênh này chưa có trong hệ thống bot.", ephemeral=True,
-            )
-            return
+    channels = db.load("channels")
+    ctv_data = db.load("ctv")
 
-        channels = db.load("channels")
-        ctv_data = db.load("ctv")
+    info = channels.get(cid, {})
+    name = info.get("name", "?")
+    role_id = info.get("role_id")
 
-        info = channels.get(cid, {})
-        name = info.get("name", "?")
-        role_id = info.get("role_id")
+    ctv_count = sum(
+        1 for uid, chs in ctv_data.items()
+        if isinstance(chs, list) and cid in chs
+    )
+    owners = [uid for uid, chs in ctv_data.items() if isinstance(chs, list) and cid in chs]
+    sub_count = follows.count_followers(owners)
 
-        ctv_count = sum(
-            1 for uid, chs in ctv_data.items()
-            if isinstance(chs, list) and cid in chs
-        )
-        owners = [uid for uid, chs in ctv_data.items() if isinstance(chs, list) and cid in chs]
-        sub_count = follows.count_followers(owners)
-
-        embed = discord.Embed(
-            title=f"🔧 Quản lý kênh: {name}",
-            description=(
-                f"**Tên:** {name}\n"
-                f"**ID:** `{cid}`\n"
-                f"**Role ID:** `{role_id}`\n"
-                f"**CTV quản lý:** {ctv_count}\n"
-                f"**Khách theo dõi CTV kênh này:** {sub_count}\n\n"
-                "Chọn thao tác bên dưới:"
-            ),
-            color=discord.Color.blurple(),
-        )
-        view = ChannelActionView(cid, name)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    embed = discord.Embed(
+        title=f"🔧 Quản lý kênh: {name}",
+        description=(
+            f"**Tên:** {name}\n"
+            f"**ID:** `{cid}`\n"
+            f"**Role ID:** `{role_id}`\n"
+            f"**CTV quản lý:** {ctv_count}\n"
+            f"**Khách theo dõi CTV kênh này:** {sub_count}\n\n"
+            "Chọn thao tác bên dưới:"
+        ),
+        color=discord.Color.blurple(),
+    )
+    view = ChannelActionView(cid, name)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 class ManageChannelSelectView(ui.View):
+    """Menu liệt kê các kênh đã lưu (hơn 25 kênh → nhiều menu)."""
+
     def __init__(self):
         super().__init__(timeout=300)
-        self.add_item(ManageChannelSelect())
+        add_select_groups(
+            self, channel_options(), "Chọn kênh cần quản lý...",
+            show_manage_channel, empty_label="Chưa có kênh nào",
+        )
 
 
 # =========================================================
@@ -335,68 +333,68 @@ class RenameChannelModal(ui.Modal):
 # =========================================================
 #  QUẢN LÝ CTV — dropdown chọn CTV
 # =========================================================
-class ManageCTVSelect(ui.UserSelect):
-    """Chọn CTV cần quản lý (gõ tên để tìm, không giới hạn 25)."""
+async def show_manage_ctv(interaction: discord.Interaction, uid: str) -> None:
+    """Hiện thông tin + các thao tác cho 1 CTV (hoặc người đã nghỉ còn lịch sử)."""
+    if uid == "none":
+        await interaction.response.send_message("Chưa có CTV nào.", ephemeral=True)
+        return
+    member = interaction.guild.get_member(int(uid)) if interaction.guild and uid.isdigit() else None
+    display_name = member.display_name if member else f"CTV {uid}"
+    ctv_data = db.load("ctv")
+    channels_data = db.load("channels")
+    display = f"{display_name} (`{uid}`)"
 
-    def __init__(self):
-        super().__init__(placeholder="Gõ tên CTV cần quản lý...", min_values=1, max_values=1)
+    if uid not in ctv_data:
+        if store.has_history(uid):
+            embed = discord.Embed(
+                title="🔧 Quản lý CTV",
+                description=(
+                    f"**{display}** không còn là CTV nhưng vẫn còn lịch sử live.\n"
+                    "Bạn có thể xóa lịch sử nếu cần."
+                ),
+                color=discord.Color.blurple(),
+            )
+            await interaction.response.send_message(
+                embed=embed, view=HistoryOnlyView(uid), ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"ℹ️ **{display}** không phải CTV.", ephemeral=True,
+            )
+        return
 
-    async def callback(self, interaction: discord.Interaction):
-        picked = self.values[0]
-        uid = str(picked.id)
-        ctv_data = db.load("ctv")
-        channels_data = db.load("channels")
-        display = f"{picked.display_name} (`{uid}`)"
+    channel_list = ctv_data.get(uid, [])
+    if not isinstance(channel_list, list):
+        channel_list = []
+    channels_info = "\n".join(
+        f"• **{channels_data.get(cid, {}).get('name', '?')}** (id: `{cid}`)"
+        for cid in channel_list
+    ) or "*(chưa có kênh nào)*"
 
-        if uid not in ctv_data:
-            if store.has_history(uid):
-                embed = discord.Embed(
-                    title="🔧 Quản lý CTV",
-                    description=(
-                        f"**{display}** không còn là CTV nhưng vẫn còn lịch sử live.\n"
-                        "Bạn có thể xóa lịch sử nếu cần."
-                    ),
-                    color=discord.Color.blurple(),
-                )
-                await interaction.response.send_message(
-                    embed=embed, view=HistoryOnlyView(uid), ephemeral=True,
-                )
-            else:
-                await interaction.response.send_message(
-                    f"ℹ️ **{display}** không phải CTV.", ephemeral=True,
-                )
-            return
-
-        channel_list = ctv_data.get(uid, [])
-        if not isinstance(channel_list, list):
-            channel_list = []
-        channels_info = "\n".join(
-            f"• **{channels_data.get(cid, {}).get('name', '?')}** (id: `{cid}`)"
-            for cid in channel_list
-        ) or "*(chưa có kênh nào)*"
-
-        embed = discord.Embed(
-            title="🔧 Quản lý CTV",
-            description=(
-                f"**CTV:** {display}\n"
-                f"**Đang quản {len(channel_list)} kênh:**\n{channels_info}\n\n"
-                "Chọn thao tác bên dưới:"
-            ),
-            color=discord.Color.blurple(),
-        )
-        view = CTVActionView(uid, channel_list, channels_data)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    embed = discord.Embed(
+        title="🔧 Quản lý CTV",
+        description=(
+            f"**CTV:** {display}\n"
+            f"**Đang quản {len(channel_list)} kênh:**\n{channels_info}\n\n"
+            "Chọn thao tác bên dưới:"
+        ),
+        color=discord.Color.blurple(),
+    )
+    view = CTVActionView(uid, channel_list, channels_data)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 class ManageCTVSelectView(ui.View):
-    def __init__(self):
+    """Menu liệt kê CTV đã lưu + người đã nghỉ còn lịch sử (hơn 25 → nhiều menu)."""
+
+    def __init__(self, guild=None):
         super().__init__(timeout=300)
-        self.add_item(ManageCTVSelect())
+        add_select_groups(
+            self, ctv_options(guild), "Chọn CTV cần quản lý...",
+            show_manage_ctv, empty_label="Chưa có CTV nào",
+        )
 
 
-# =========================================================
-#  CTV ACTION VIEW — nút cho từng kênh + nút xóa hoàn toàn
-# =========================================================
 class RemoveFromChannelSelect(ui.Select):
     """Chọn 1 kênh để bỏ CTV khỏi kênh đó."""
 

@@ -25,10 +25,39 @@ class UserPanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ids, ["user_channel_select", "user_channel_select_2", "user_channel_select_3"])
         self.assertEqual([len(c.options) for c in view.children], [25, 25, 10])
 
-    async def test_check_ctv_panel_uses_member_picker(self):
+    async def test_check_ctv_panel_lists_saved_ctv_with_names(self):
+        from views import select_utils
         from views.check_ctv_view import CheckCTVPanelView
-        view = CheckCTVPanelView()
-        self.assertIsInstance(view.children[0], discord.ui.UserSelect)
+        db.save("channels", {"100": {"name": "Kênh A", "role_id": 0}})
+        db.save("ctv", {str(i): ["100"] for i in range(1, 31)})          # 30 CTV
+        members = {i: NS(display_name=f"Người {i:02d}") for i in range(1, 31)}
+        guild = NS(get_member=lambda i: members.get(i))
+        store = SessionStore(":memory:")
+        store.add_session("999", "100", "stream", 0, 3600)                 # người đã nghỉ còn lịch sử
+        with mock.patch.object(select_utils, "store", store):
+            view = CheckCTVPanelView(guild)
+        store.close()
+
+        self.assertEqual([c.custom_id for c in view.children], ["check_ctv_select", "check_ctv_select_2"])
+        labels = [o.label for c in view.children for o in c.options]
+        self.assertEqual(labels[0], "Người 01")
+        self.assertEqual(len(labels), 31)
+        self.assertEqual(labels[-1], "CTV 999 (đã nghỉ)")
+        self.assertEqual(view.children[0].options[0].description, "Quản lý: Kênh A")
+
+    async def test_manage_views_list_saved_data(self):
+        from views.add_flow_views import AddCTVChannelSelectView
+        from views.broadcast_view import BroadcastView
+        from views.manage_flow_views import ManageChannelSelectView, ManageCTVSelectView
+        db.save("channels", {"2": {"name": "B", "role_id": 0}, "1": {"name": "A", "role_id": 5}})
+        db.save("ctv", {"7": ["1"]})
+        for v in (AddCTVChannelSelectView(), ManageChannelSelectView()):
+            self.assertEqual([o.label for o in v.children[0].options], ["A", "B"])
+            self.assertIsInstance(v.children[0], discord.ui.Select)
+        self.assertEqual(ManageChannelSelectView().children[0].options[0].description, "🔒 Riêng tư · 1 CTV")
+        self.assertEqual([o.value for o in ManageCTVSelectView().children[0].options], ["7"])
+        bv = BroadcastView()
+        self.assertEqual(len(bv.to_components()), 3)   # nút / menu kênh / nút
 
 
 class EmbedSafetyTests(unittest.TestCase):

@@ -27,8 +27,8 @@ log = logging.getLogger(__name__)
 
 
 # Tăng số này khi cấu trúc panel thay đổi → bot tự gửi lại panel 1 lần khi khởi động
-# (v2: Check CTV dùng ô chọn thành viên, panel khách chia nhiều menu)
-PANEL_VERSION = "2"
+# (v2: panel khách chia nhiều menu; v3: Check CTV liệt kê sẵn CTV đã lưu kèm tên)
+PANEL_VERSION = "3"
 
 # Panel name → channel_id từ .env
 PANEL_CHANNELS = {
@@ -38,7 +38,7 @@ PANEL_CHANNELS = {
 }
 
 
-def _build_panel(panel_name: str):
+def _build_panel(panel_name: str, guild=None):
     """Build (embed, view) cho từng loại panel. Import lazy để tránh circular."""
     from views.admin_view import AdminPanelView
     from views.user_view import UserSelectView
@@ -73,7 +73,7 @@ def _build_panel(panel_name: str):
             ),
             color=discord.Color.purple(),
         )
-        return embed, CheckCTVPanelView()
+        return embed, CheckCTVPanelView(guild)
 
     return None, None
 
@@ -113,7 +113,7 @@ async def refresh_panel(bot, panel_name: str) -> bool:
             log.exception(f"Xóa msg {old_msg_id} lỗi")
 
     # Build và gửi msg mới
-    embed, view = _build_panel(panel_name)
+    embed, view = _build_panel(panel_name, getattr(channel, "guild", None))
     if embed is None:
         return False
 
