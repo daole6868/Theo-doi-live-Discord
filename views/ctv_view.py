@@ -15,7 +15,7 @@ from discord import ui
 
 from core.data_manager import db
 from helpers.stats import create_channel_report
-from helpers.time_utils import now_vn
+from helpers.time_utils import now_vn, parse_hhmm
 
 log = logging.getLogger(__name__)
 
@@ -53,34 +53,23 @@ class NextLiveModal(ui.Modal, title="Đặt Giờ Live Tiếp Theo"):
         self.channel_id = str(channel_id)
 
         self.time_input = ui.TextInput(
-            label="Giờ Live (HH:MM - giờ Việt Nam)",
-            placeholder="Ví dụ: 20:00 hoặc 08:30",
+            label="Giờ Live (giờ Việt Nam)",
+            placeholder="Ví dụ: 20:00, 20h, 20h30, 8:30",
             max_length=5,
-            min_length=3,
+            min_length=1,
             required=True,
         )
         self.add_item(self.time_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Parse HH:MM (chấp nhận cả 20:00, 20.00, 20h00)
-        raw = self.time_input.value.strip().replace(".", ":").replace("h", ":").replace("H", ":")
-        m = re.match(r"^(\d{1,2}):(\d{1,2})$", raw)
-        if not m:
+        parsed = parse_hhmm(self.time_input.value)
+        if parsed is None:
             await interaction.response.send_message(
-                "⚠️ Định dạng không đúng. Nhập theo `HH:MM` (VD: `20:00` hoặc `8:30`).",
+                "⚠️ Giờ không hợp lệ. Nhập kiểu `20:00`, `20h`, `20h30` hoặc `8:30` (giờ 0-23, phút 0-59).",
                 ephemeral=True,
             )
             return
-
-        hour = int(m.group(1))
-        minute = int(m.group(2))
-
-        if hour > 23 or minute > 59:
-            await interaction.response.send_message(
-                "⚠️ Giờ phải 0-23, phút phải 0-59.",
-                ephemeral=True,
-            )
-            return
+        hour, minute = parsed
 
         # Tính target theo giờ VN
         now = now_vn()

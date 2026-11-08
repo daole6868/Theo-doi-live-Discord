@@ -8,6 +8,7 @@ Ghi chú compat: các session cũ lưu timestamp bằng datetime.now().timestamp
 vẫn đọc được vì .timestamp() luôn ra UTC epoch (bất kể tz của datetime).
 """
 import datetime
+import re
 
 from config import VN_TZ
 
@@ -79,3 +80,23 @@ def split_by_day(start_ts: float, end_ts: float) -> list[tuple[float, float, dat
         pieces.append((cur, piece_end, day))
         cur = piece_end
     return pieces
+
+
+_HHMM_RE = re.compile(r"^(\d{1,2})(?:\s*[:h.g]\s*(\d{1,2})?)?$")
+_HHMM_COMPACT_RE = re.compile(r"^(\d{2})(\d{2})$")
+
+
+def parse_hhmm(text: str) -> tuple[int, int] | None:
+    """
+    Đọc giờ người dùng nhập. Chấp nhận: 20:00, 20.00, 20h00, 20h30, 20h, 20, 8:5, 2030.
+    Trả về (giờ, phút) hoặc None nếu không hợp lệ.
+    """
+    raw = (text or "").strip().lower()
+    m = _HHMM_COMPACT_RE.match(raw) or _HHMM_RE.match(raw)
+    if not m:
+        return None
+    hour = int(m.group(1))
+    minute = int(m.group(2) or 0)
+    if hour > 23 or minute > 59:
+        return None
+    return hour, minute

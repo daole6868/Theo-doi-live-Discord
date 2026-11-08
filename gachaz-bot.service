@@ -3,6 +3,9 @@ Description=Gachaz Live Bot - Discord CTV Manager
 Documentation=https://github.com/your-repo/gachaz-live-bot
 After=network-online.target
 Wants=network-online.target
+# Restart tối đa 5 lần trong 60 giây (đặt ở [Unit] theo systemd mới)
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -20,8 +23,8 @@ ExecStart=/opt/gachaz-live-bot/.venv/bin/python /opt/gachaz-live-bot/main.py
 # Restart policy
 Restart=always
 RestartSec=10
-StartLimitInterval=60
-StartLimitBurst=5
+# Cho bot 20 giây để ghi nhịp tim cuối cùng khi dừng/restart
+TimeoutStopSec=20
 
 # Logging → journalctl
 StandardOutput=journal
@@ -29,7 +32,7 @@ StandardError=journal
 SyslogIdentifier=gachaz-bot
 
 # Resource limits (optional, tránh runaway)
-MemoryLimit=1G
+MemoryMax=1G
 
 [Install]
 WantedBy=multi-user.target

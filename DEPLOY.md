@@ -2,6 +2,8 @@
 
 Pattern giống bot `fb-monitor` đã deploy trước, chỉ thêm bước cài FFmpeg + libopus cho voice.
 
+> **Đang nâng cấp từ bản cũ?** Đọc mục [11. Nâng cấp từ bản cũ](#11-nâng-cấp-từ-bản-cũ) trước.
+
 ---
 
 ## 1. Requirements
@@ -26,7 +28,7 @@ apt install -y \
   python3 python3-pip python3-venv python3-dev \
   ffmpeg libopus0 libopus-dev \
   libffi-dev libnacl-dev \
-  git nano
+  sqlite3 git nano
 ```
 
 **Verify FFmpeg:**
@@ -82,23 +84,42 @@ DISCORD_TOKEN=your_real_token_here
 GUILD_ID=1235074618180636772
 TARGET_CATEGORY_ID=1235075173498097686
 ADMIN_CHANNEL_ID=xxx
+ADMIN_ROLE_ID=0
 USER_CHANNEL_ID=xxx
 LEADERBOARD_CHANNEL_ID=xxx
 LATE_ALERT_CHANNEL_ID=xxx
 CHECK_CTV_CHANNEL_ID=xxx
 ```
 
+- `GUILD_ID`: bot **chỉ** tính giờ / nhắc trong server này.
+- `ADMIN_ROLE_ID`: role quản lý được bấm Admin Dashboard (ngoài người có quyền Administrator). Để `0` nếu chỉ cho Administrator.
+
 Save: `Ctrl+O` → `Enter` → `Ctrl+X`.
 
 ---
 
-## 6. Test chạy 1 lần
+## 6. ⚠️ Discord Developer Portal (BẮT BUỘC)
+
+Vào https://discord.com/developers/applications → chọn bot:
+
+1. **Bot** → mục **Privileged Gateway Intents** → bật **SERVER MEMBERS INTENT** → Save.
+   Thiếu bước này bot sẽ **không khởi động được** (lỗi `PrivilegedIntentsRequired`).
+   Bot **không** cần Message Content Intent nữa.
+2. **OAuth2 → URL Generator** → tick scope **`bot`** và **`applications.commands`**
+   (để có lệnh `/setup`) → tick các quyền ở mục 10 → mở link để mời lại bot vào server.
+   Bot đã có trong server thì mời lại bằng link mới cũng được, không mất gì.
+
+---
+
+## 7. Test chạy 1 lần
 
 ```bash
 python main.py
 ```
 
 Nếu thấy `✅ Bot đã đăng nhập: [tên bot]` → OK, `Ctrl+C` để dừng.
+
+Lần đầu chạy, vào kênh admin gõ **`/setup`** để bot gửi các panel.
 
 **Nếu lỗi TTS/voice:**
 ```bash
@@ -115,9 +136,14 @@ ls -la /tmp/test.mp3
 # Nếu file có size > 0 → edge-tts work
 ```
 
+**Chạy bộ test tự động (không cần token thật):**
+```bash
+python -m unittest discover -s tests -t .
+```
+
 ---
 
-## 7. Setup systemd auto-restart
+## 8. Setup systemd auto-restart
 
 ```bash
 # Copy file service kèm project
@@ -136,7 +162,7 @@ Nếu status là `active (running)` → **BOT ĐÃ CHẠY 24/7**.
 
 ---
 
-## 8. Xem log
+## 9. Xem log / Restart / Stop
 
 ```bash
 # Log systemd (real-time)
@@ -144,22 +170,15 @@ sudo journalctl -u gachaz-bot -f
 
 # Log file bot (có rotate 5MB × 5)
 tail -f /opt/gachaz-live-bot/logs/bot.log
-```
 
----
-
-## 9. Restart / Stop bot
-
-```bash
-# Restart (khi update code)
+# Restart (khi update code) / Stop / Start
 sudo systemctl restart gachaz-bot
-
-# Stop
 sudo systemctl stop gachaz-bot
-
-# Start
 sudo systemctl start gachaz-bot
 ```
+
+Restart / stop bằng systemctl là **an toàn**: bot ghi lại mốc thời gian trước khi tắt,
+phiên live đang chạy được chốt đúng lúc tắt, khoảng bot offline **không** được tính giờ.
 
 ---
 
@@ -171,17 +190,66 @@ Vào Discord Server → **Server Settings** → **Roles** → chọn Role của 
 - ✅ View Channel
 - ✅ Send Messages
 - ✅ Read Message History
+- ✅ Embed Links
 - ✅ Manage Channels *(tạo/xóa voice channel)*
 - ✅ Manage Roles *(tạo/xóa role, gán role — role bot phải cao hơn role sẽ quản)*
-- ✅ **Move Members** *(kick CTV khỏi voice — VOICE ALERT)*
-- ✅ **Connect** *(bot vào voice channel)*
-- ✅ **Speak** *(phát audio TTS)*
+- ✅ **Move Members** *(Voice Alert ngắt CTV khỏi voice)*
+- ✅ **Connect** *(bot vào voice channel để phát nhắc)*
+- ✅ **Speak** *(phát giọng nói)*
+
+Voice Alert giờ áp dụng cho **mọi kênh voice** (trừ kênh AFK) → bot cần Connect/Speak
+ở mọi kênh voice CTV có thể vào. Kênh nào chặn bot thì bot vẫn ngắt được (Move Members)
+nhưng không phát được giọng nhắc.
 
 Nếu thiếu bất kỳ permission nào → tính năng đó sẽ fail (log sẽ báo `Forbidden`).
 
 ---
 
+## 11. Nâng cấp từ bản cũ
+
+```bash
+cd /opt/gachaz-live-bot
+
+# 1. Sao lưu dữ liệu trước
+mkdir -p /root/backup
+tar czf /root/backup/gachaz-data-truoc-nang-cap.tar.gz data/ .env
+
+# 2. Lấy code mới (git pull, hoặc scp đè code — KHÔNG đè thư mục data/ và file .env)
+git pull
+
+# 3. Cài thư viện theo phiên bản mới + cập nhật file systemd
+source .venv/bin/activate
+pip install -r requirements.txt
+sudo cp gachaz-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+
+# 4. Làm mục 6 (bật Server Members Intent + mời lại bot với scope applications.commands)
+
+# 5. Khởi động lại
+sudo systemctl restart gachaz-bot
+```
+
+**Lần đầu chạy bản mới, bot tự làm:**
+- Chuyển lịch sử live từ `data/data_sessions.json` sang `data/sessions.db` (SQLite, giữ vĩnh viễn).
+  File JSON cũ được đổi tên thành `data_sessions.json.migrated` để đối chiếu nếu cần.
+- Chuyển lịch live tiếp theo sang dạng gắn theo từng CTV.
+- Phiên đang live lúc nâng cấp: CTV vẫn đang live thì tính tiếp; phiên cũ không xác minh được
+  (vd. "phiên ma" do lỗi bản cũ) thì bỏ, không cộng giờ ảo.
+- Gửi lại các panel 1 lần (panel Check CTV đổi sang ô chọn thành viên).
+- Không gửi trùng bảng xếp hạng hôm qua.
+
+Lệnh `!setup` cũ đã thay bằng **`/setup`**.
+
+---
+
 ## 🔧 Troubleshooting
+
+### Bot không khởi động, log báo `PrivilegedIntentsRequired`
+→ Chưa bật **Server Members Intent** (mục 6).
+
+### Không thấy lệnh `/setup`
+→ Mời lại bot với scope `applications.commands` (mục 6), kiểm tra `GUILD_ID` trong `.env`
+đúng server, rồi restart bot. Lệnh chỉ hiện với người có quyền Administrator.
 
 ### Bot không phát được voice
 ```bash
@@ -207,20 +275,6 @@ pip install --force-reinstall PyNaCl
 - Discord: Role bot cần **cao hơn** role CTV trong hierarchy
 - Discord: Bot cần permission **Move Members**
 
-### Update code
-```bash
-cd /opt/gachaz-live-bot
-
-# Nếu dùng git
-git pull
-
-# Nếu dùng scp (chạy từ máy local)
-# scp -r C:\gachaz-live-bot\* root@vps:/opt/gachaz-live-bot/
-
-# Restart bot
-sudo systemctl restart gachaz-bot
-```
-
 ### Xem lịch sử log gần nhất
 ```bash
 sudo journalctl -u gachaz-bot -n 200 --no-pager
@@ -238,12 +292,15 @@ sudo journalctl -u gachaz-bot -n 200 --no-pager
 ├── config.py
 ├── requirements.txt
 ├── gachaz-bot.service        ← Systemd template
-├── data/                     ← JSON persist tự tạo
+├── data/                     ← Dữ liệu (tự tạo)
+│   ├── sessions.db           ← Lịch sử live + audio (SQLite, giữ vĩnh viễn)
+│   └── data_*.json           ← Kênh, CTV, khách đăng ký, cài đặt...
 ├── logs/                     ← Bot log (rotate 5MB)
 ├── core/ helpers/ views/ cogs/
+└── tests/                    ← Test tự động
 
 /etc/systemd/system/
-└── gachaz-bot.service        ← Symlink từ file trên
+└── gachaz-bot.service        ← Bản copy từ file trên
 ```
 
 ---
@@ -256,12 +313,12 @@ sudo journalctl -u gachaz-bot -n 200 --no-pager
 - Log riêng → dễ quản lý
 - Không cần chia CPU/RAM đặc biệt
 
-**Backup data:**
+**Backup data mỗi ngày (2h sáng):**
 ```bash
-# Cron job backup mỗi ngày
+mkdir -p /root/backup
 crontab -e
-# Thêm: 
-0 2 * * * cd /opt/gachaz-live-bot && tar czf /root/backup/gachaz-data-$(date +\%Y\%m\%d).tar.gz data/
+# Thêm dòng sau (sao lưu SQLite an toàn khi bot đang chạy + các file JSON):
+0 2 * * * cd /opt/gachaz-live-bot && sqlite3 data/sessions.db ".backup data/sessions-backup.db" && tar czf /root/backup/gachaz-data-$(date +\%Y\%m\%d).tar.gz data/*.json data/sessions-backup.db
 ```
 
 **Kiểm tra RAM/CPU bot:**

@@ -3,12 +3,14 @@ Entry point cho Gachaz Live Bot.
 
 Chạy: python main.py
 """
+import asyncio
 import logging
+import signal
 
 import discord
 from discord.ext import commands
 
-from config import TOKEN
+from config import GUILD_ID, TOKEN
 from core.logger import setup_logging
 from helpers.migration import run_all_migrations
 from helpers.stats import set_channel_name_resolver
@@ -25,8 +27,9 @@ log = logging.getLogger("main")
 
 
 # ============ INTENTS ============
+# Cần bật "Server Members Intent" trong Discord Developer Portal (xem DEPLOY.md).
+# Không cần Message Content: lệnh /setup là lệnh gạch chéo.
 intents = discord.Intents.default()
-intents.message_content = True
 intents.voice_states = True
 intents.members = True
 
@@ -39,6 +42,14 @@ class GachazBot(commands.Bot):
 
         # 0. Migrations (chạy trước mọi thứ khác)
         run_all_migrations()
+
+        # systemctl stop/restart gửi SIGTERM → tắt có kiểm soát (ghi nhịp tim cuối)
+        try:
+            asyncio.get_running_loop().add_signal_handler(
+                signal.SIGTERM, lambda: asyncio.create_task(self.close())
+            )
+        except (NotImplementedError, RuntimeError):
+            pass  # Windows không hỗ trợ — bỏ qua
 
         # Báo cáo lấy tên kênh từ Discord cho kênh chưa lưu trong hệ thống
         set_channel_name_resolver(self._resolve_channel_name)
@@ -70,6 +81,18 @@ class GachazBot(commands.Bot):
             except Exception:
                 log.exception(f"✗ Load cog {ext} thất bại")
 
+        # 4. Đăng ký lệnh gạch chéo (/setup) — đồng bộ vào server để hiện ngay
+        try:
+            if GUILD_ID:
+                guild = discord.Object(id=GUILD_ID)
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+            else:
+                synced = await self.tree.sync()
+            log.info(f"✓ Đồng bộ {len(synced)} lệnh gạch chéo")
+        except Exception:
+            log.exception("✗ Đồng bộ lệnh gạch chéo thất bại")
+
         log.info("SETUP HOOK xong.")
         log.info("=" * 60)
 
@@ -92,15 +115,21 @@ class GachazBot(commands.Bot):
         await super().close()
 
 
-bot = GachazBot(command_prefix="!", intents=intents, help_command=None)
+bot = GachazBot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
 
 
 # ============ GLOBAL ERROR HANDLER ============
-@bot.event
-async def on_command_error(ctx: commands.Context, error):
-    if isinstance(error, commands.CommandNotFound):
-        return
-    log.exception(f"Command error trong '{ctx.command}': {error}")
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error):
+    log.exception(f"Lỗi lệnh /{interaction.command.name if interaction.command else '?'}: {error}")
+    msg = "⚠️ Có lỗi khi chạy lệnh, xem log của bot."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
 
 
 # ============ RUN ============

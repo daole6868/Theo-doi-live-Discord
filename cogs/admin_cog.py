@@ -1,11 +1,16 @@
 """
 Admin commands cog.
 
-Lệnh chính: !setup — refresh cả 3 panel (Admin / User / Check CTV).
+Lệnh chính: /setup — gửi lại cả 3 panel (Admin / User / Check CTV).
 Dùng helpers/panels.refresh_panel() để atomic: xóa msg cũ + gửi msg mới + lưu ID.
+
+Dùng lệnh gạch chéo (slash command) nên bot KHÔNG cần intent Message Content.
+Chỉ người có quyền Administrator mới thấy lệnh này.
 """
 import logging
 
+import discord
+from discord import app_commands
 from discord.ext import commands
 
 from core.session_store import store
@@ -37,19 +42,24 @@ class AdminCog(commands.Cog):
         store.set_meta("panel_version", PANEL_VERSION)
         log.info(f"✓ Đã làm mới panel lên phiên bản {PANEL_VERSION}")
 
-    @commands.command(name="setup")
-    @commands.has_permissions(administrator=True)
-    async def setup_cmd(self, ctx: commands.Context):
-        """Post/refresh lại toàn bộ 3 panel."""
+    @app_commands.command(name="setup", description="Gửi lại các panel của bot (Admin / Khách / Check CTV)")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    async def setup_cmd(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "⛔ Bạn cần quyền **Administrator** để dùng lệnh này.", ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
         results: list[str] = []
 
         for panel_name in ("admin", "user", "check_ctv"):
             channel_id = PANEL_CHANNELS.get(panel_name, 0)
-
             if not channel_id:
                 results.append(f"ℹ️ **{panel_name}**: chưa cấu hình `{panel_name.upper()}_CHANNEL_ID` trong .env")
                 continue
-
             try:
                 ok = await refresh_panel(self.bot, panel_name)
                 if ok:
@@ -60,15 +70,7 @@ class AdminCog(commands.Cog):
                 log.exception(f"Refresh panel {panel_name} lỗi")
                 results.append(f"⚠️ **{panel_name}** panel: {e}")
 
-        await ctx.send("**Setup kết quả:**\n" + "\n".join(results))
-
-    @setup_cmd.error
-    async def _setup_err(self, ctx: commands.Context, error):
-        if isinstance(error, commands.MissingPermissions):
-            await ctx.send("⛔ Bạn cần quyền **Administrator** để dùng lệnh này.")
-        else:
-            log.exception("!setup command error")
-            await ctx.send(f"⚠️ Lỗi: {error}")
+        await interaction.followup.send("**Setup kết quả:**\n" + "\n".join(results), ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
