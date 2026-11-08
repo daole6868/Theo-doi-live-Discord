@@ -25,13 +25,89 @@ log = logging.getLogger(__name__)
 
 
 # =========================================================
-#  DYNAMIC BUTTON: Tắt Thông Báo (persistent qua custom_id)
+#  TẮT THÔNG BÁO
 # =========================================================
+def _remove_user_from_channels(subs: dict, uid_str: str, channel_ids) -> list[str]:
+    """Bỏ `uid_str` khỏi danh sách đăng ký của các kênh. Trả về các kênh đã bỏ."""
+    removed: list[str] = []
+    for cid in {str(c) for c in channel_ids}:
+        lst = subs.get(cid)
+        if not isinstance(lst, list):
+            continue
+        before = len(lst)
+        subs[cid] = [u for u in lst if str(u) != uid_str]
+        if len(subs[cid]) != before:
+            removed.append(cid)
+    return removed
+
+
+async def _unsubscribe_and_reply(interaction: discord.Interaction, channel_ids, empty_hint: str):
+    uid_str = str(interaction.user.id)
+    removed: list[str] = []
+
+    def _save(subs):
+        removed.extend(_remove_user_from_channels(subs, uid_str, channel_ids))
+
+    await db.aupdate("subscribers", _save)
+
+    if removed:
+        channels_data = db.load("channels")
+        names = ", ".join(f"**{channels_data.get(c, {}).get('name', f'Kênh {c}')}**" for c in removed)
+        await interaction.followup.send(f"✅ Đã tắt thông báo kênh: {names}.", ephemeral=True)
+        log.info(f"User {uid_str} tắt thông báo qua DM: {removed}")
+    else:
+        await interaction.followup.send(empty_hint, ephemeral=True)
+
+
+class NotifyOffCTVButton(
+    ui.DynamicItem[ui.Button],
+    template=r"notify_off_ctv:(?P<uid>\d+)",
+):
+    """
+    Nút Tắt Thông Báo trong DM báo live (bản mới).
+
+    Gắn theo CTV đang live: khách nhận DM vì đã bật thông báo ở 1 hay nhiều kênh
+    do CTV này quản lý → bấm nút sẽ tắt đăng ký ở TẤT CẢ các kênh đó, bất kể CTV
+    đang live ở kênh nào.
+    """
+
+    def __init__(self, ctv_id):
+        super().__init__(
+            ui.Button(
+                style=discord.ButtonStyle.danger,
+                label="Tắt Thông Báo 🔕",
+                custom_id=f"notify_off_ctv:{ctv_id}",
+            )
+        )
+        self.ctv_id = str(ctv_id)
+
+    @classmethod
+    async def from_custom_id(
+        cls, interaction: discord.Interaction, item: ui.Button, match: re.Match[str]
+    ) -> "NotifyOffCTVButton":
+        return cls(match["uid"])
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        managed = db.load("ctv").get(self.ctv_id) or []
+        await _unsubscribe_and_reply(
+            interaction,
+            managed,
+            "ℹ️ Bạn không còn đăng ký kênh nào của CTV này. "
+            "Muốn chỉnh từng kênh, vào kênh chọn live và chọn kênh đó.",
+        )
+
+
 class NotifyOffButton(
     ui.DynamicItem[ui.Button],
     template=r"notify_off:(?P<cid>\d+)",
 ):
-    """Nút Tắt Thông Báo trong DM báo Live cho subscriber."""
+    """
+    Nút Tắt Thông Báo trong các DM CŨ (gửi trước bản sửa lỗi).
+
+    custom_id cũ chứa kênh đang live chứ không phải kênh khách đăng ký, nên bỏ
+    đăng ký ở kênh đó + mọi kênh của các CTV chủ kênh đó.
+    """
 
     def __init__(self, channel_id):
         super().__init__(
@@ -51,35 +127,27 @@ class NotifyOffButton(
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-
-        uid_str = str(interaction.user.id)
-        removed = False
-
-        def _save(subs):
-            nonlocal removed
-            if self.channel_id in subs:
-                lst = subs[self.channel_id]
-                to_remove = [u for u in lst if str(u) == uid_str]
-                for u in to_remove:
-                    lst.remove(u)
-                    removed = True
-
-        await db.aupdate("subscribers", _save)
-
-        if removed:
-            await interaction.followup.send("✅ Đã tắt thông báo cho kênh này.", ephemeral=True)
-        else:
-            await interaction.followup.send("Bạn chưa đăng ký hoặc đã tắt rồi.", ephemeral=True)
+        ctv_data = db.load("ctv")
+        channel_ids = {self.channel_id}
+        for chans in ctv_data.values():
+            if isinstance(chans, list) and self.channel_id in chans:
+                channel_ids.update(str(c) for c in chans)
+        await _unsubscribe_and_reply(
+            interaction,
+            channel_ids,
+            "ℹ️ Tin nhắn này là bản cũ nên bot không xác định được kênh bạn đã đăng ký. "
+            "Vào kênh chọn live, chọn kênh bạn đã bật thông báo rồi bấm **Tắt Thông Báo**.",
+        )
 
 
 # =========================================================
 #  NOTIFY VIEW — DM cho subscriber khi kênh Live
 # =========================================================
 class NotifyView(ui.View):
-    def __init__(self, channel_id, guild_id):
+    def __init__(self, channel_id, guild_id, ctv_id=None):
         super().__init__(timeout=None)
 
-        # Link nhảy vào kênh voice (persistent tự động)
+        # Link nhảy vào kênh voice đang live (persistent tự động)
         link_url = f"https://discord.com/channels/{guild_id}/{channel_id}"
         self.add_item(ui.Button(
             label="Xem Ngay 🔴",
@@ -87,8 +155,11 @@ class NotifyView(ui.View):
             url=link_url,
         ))
 
-        # Nút tắt thông báo (dynamic, persistent qua custom_id)
-        self.add_item(NotifyOffButton(channel_id))
+        # Nút tắt thông báo (dynamic, persistent qua custom_id) — gắn theo CTV
+        if ctv_id is not None:
+            self.add_item(NotifyOffCTVButton(ctv_id))
+        else:
+            self.add_item(NotifyOffButton(channel_id))
 
 
 # =========================================================

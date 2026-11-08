@@ -157,3 +157,53 @@ class NextLiveMigrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnsubscribeTests(unittest.IsolatedAsyncioTestCase):
+    """Lỗi cũ: nút Tắt Thông Báo trong DM tắt nhầm kênh đang live → khách vẫn nhận DM."""
+
+    async def asyncSetUp(self):
+        db.save("ctv", {"1": ["100", "101"]})
+        db.save("channels", {"100": {"name": "Kênh A", "role_id": 0}, "101": {"name": "Kênh C", "role_id": 0}})
+        db.save("subscribers", {"100": ["900"], "101": ["900", "901"]})
+
+    def _inter(self, uid):
+        return NS(user=NS(id=uid), response=NS(defer=mock.AsyncMock()), followup=NS(send=mock.AsyncMock()))
+
+    async def test_dm_built_with_ctv_button_and_reason(self):
+        sent = {}
+        users = {}
+
+        def get_user(uid):
+            users.setdefault(uid, NS(send=mock.AsyncMock(side_effect=lambda **kw: sent.setdefault(uid, kw))))
+            return users[uid]
+
+        bot = FakeBot()
+        bot.get_user = get_user
+        cog = live_tracker_cog.LiveTrackerCog(bot)
+        live_channel = NS(id=555, name="Kênh khác", guild=NS(id=1))   # CTV live ở kênh KHÔNG ai đăng ký
+        await cog._notify_subscribers(live_channel, NS(id=1, display_name="CTV1"))
+
+        self.assertEqual(sorted(sent), [900, 901])
+        ids = [c.custom_id for c in sent[900]["view"].children if getattr(c, "custom_id", None)]
+        self.assertEqual(ids, ["notify_off_ctv:1"])
+        self.assertIn("Kênh A, Kênh C", sent[900]["embed"].description)
+        self.assertIn("Kênh C", sent[901]["embed"].description)
+
+    async def test_ctv_off_button_removes_all_subscribed_channels(self):
+        from views.notify_view import NotifyOffCTVButton
+        inter = self._inter(900)
+        await NotifyOffCTVButton("1").callback(inter)
+        self.assertEqual(db.load("subscribers"), {"100": [], "101": ["901"]})
+        self.assertIn("Đã tắt", inter.followup.send.await_args.args[0])
+
+    async def test_legacy_button(self):
+        from views.notify_view import NotifyOffButton
+        inter = self._inter(900)
+        await NotifyOffButton("100").callback(inter)          # kênh của CTV → tắt cả kênh của CTV đó
+        self.assertEqual(db.load("subscribers"), {"100": [], "101": ["901"]})
+
+        inter = self._inter(901)
+        await NotifyOffButton("555").callback(inter)          # kênh lạ → hướng dẫn tắt trong panel
+        self.assertEqual(db.load("subscribers")["101"], ["901"])
+        self.assertIn("kênh chọn live", inter.followup.send.await_args.args[0])

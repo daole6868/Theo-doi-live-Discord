@@ -17,7 +17,7 @@ from helpers.stats import set_channel_name_resolver
 from views.admin_view import AdminPanelView
 from views.user_view import UserSelectView
 from views.check_ctv_view import CheckCTVPanelView
-from views.notify_view import NotifyOffButton, ReminderDelayButton
+from views.notify_view import NotifyOffButton, NotifyOffCTVButton, ReminderDelayButton
 from views.ctv_view import OpenNextLiveModalButton
 
 
@@ -62,11 +62,12 @@ class GachazBot(commands.Bot):
 
         # 2. Dynamic items (custom_id encode channel_id)
         self.add_dynamic_items(
-            NotifyOffButton,
+            NotifyOffButton,      # DM cũ
+            NotifyOffCTVButton,   # DM mới: tắt theo CTV
             ReminderDelayButton,
             OpenNextLiveModalButton,  # Modal nhập giờ live tiếp theo (persistent)
         )
-        log.info("✓ Đăng ký 3 dynamic item (NotifyOff, ReminderDelay, NextLive)")
+        log.info("✓ Đăng ký 4 dynamic item (NotifyOff cũ/mới, ReminderDelay, NextLive)")
 
         # 3. Load cogs
         for ext in (
