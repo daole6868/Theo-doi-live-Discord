@@ -3,9 +3,9 @@ View cho khách hàng: dropdown chọn kênh + hiển thị trạng thái Live/O
 
 FIX (batch 4A):
 - Dùng 2 embed key khác nhau cho CTV đang LIVE và OFFLINE (theo yêu cầu #4).
-- Cấu trúc subscribers giữ nguyên keyed by channel_id (không breaking),
-  nhưng logic notify đã đổi trong live_tracker_cog: khi CTV Y live ở kênh nào đó,
-  bot sẽ notify tất cả subs của các kênh Y quản lý (yêu cầu #3).
+- Thông báo theo CTV: "Bật Thông Báo" ở 1 kênh = theo dõi các CTV chủ kênh đó;
+  CTV live ở bất kỳ kênh nào → khách theo dõi nhận DM. Nút Tắt ở đây và nút Tắt
+  trong DM dùng chung helpers/follows.py nên luôn giống nhau.
 """
 import logging
 
@@ -19,6 +19,7 @@ from config import (
 )
 from core.data_manager import db
 from core.state import state
+from helpers import follows
 from helpers.embeds import clamp_embed, get_custom_embed
 from helpers.permissions import is_admin
 from helpers.stats import (
@@ -51,10 +52,13 @@ class CustomerView(ui.View):
                 url=link_url,
             ))
 
-        subs = db.load("subscribers")
-        is_subscribed = self._user_in_subs(subs.get(self.channel_id, []))
-
-        if is_subscribed:
+        # Thông báo theo CTV chủ kênh (giống hệt nút Tắt trong DM báo live)
+        self.owners = get_channel_owners(self.channel_id)
+        if not self.owners:
+            self.notify_btn = ui.Button(
+                label="Kênh chưa có CTV", style=discord.ButtonStyle.secondary, disabled=True,
+            )
+        elif follows.following(user_id, self.owners):
             self.notify_btn = ui.Button(label="Tắt Thông Báo", style=discord.ButtonStyle.danger)
         else:
             self.notify_btn = ui.Button(label="Bật Thông Báo", style=discord.ButtonStyle.success)
@@ -65,38 +69,37 @@ class CustomerView(ui.View):
         self.check_btn.callback = self.check_stats
         self.add_item(self.check_btn)
 
-    def _user_in_subs(self, subs_list) -> bool:
-        uid_str = str(self.user_id)
-        return any(str(u) == uid_str for u in subs_list)
+    @staticmethod
+    def _names(guild, ctv_ids) -> str:
+        out = []
+        for x in ctv_ids:
+            m = guild.get_member(int(x)) if guild is not None else None
+            out.append(f"**{m.display_name}**" if m else f"<@{x}>")
+        return ", ".join(out)
 
     async def toggle_notify(self, interaction: discord.Interaction):
-        uid_str = str(interaction.user.id)
-        turned_on = None
+        """Bật = theo dõi các CTV chủ kênh; Tắt = bỏ theo dõi các CTV đó (ở mọi kênh)."""
+        owners = get_channel_owners(self.channel_id)  # đọc lại phòng admin vừa đổi CTV
+        if not owners:
+            await interaction.response.send_message("ℹ️ Kênh này chưa có CTV để theo dõi.", ephemeral=True)
+            return
 
-        def _save(subs):
-            nonlocal turned_on
-            if self.channel_id not in subs:
-                subs[self.channel_id] = []
-            lst = subs[self.channel_id]
-            existing = [u for u in lst if str(u) == uid_str]
-            if existing:
-                for e in existing:
-                    lst.remove(e)
-                turned_on = False
-            else:
-                lst.append(uid_str)
-                turned_on = True
-
-        await db.aupdate("subscribers", _save)
-
-        if turned_on:
-            self.notify_btn.label = "Tắt Thông Báo"
-            self.notify_btn.style = discord.ButtonStyle.danger
-            msg = "✅ Đã BẬT thông báo. Bạn sẽ nhận DM khi CTV của kênh này Live (kể cả họ live ở kênh khác)."
-        else:
+        if follows.following(interaction.user.id, owners):
+            changed = await follows.unfollow(interaction.user.id, owners)
             self.notify_btn.label = "Bật Thông Báo"
             self.notify_btn.style = discord.ButtonStyle.success
-            msg = "🔕 Đã TẮT thông báo kênh này."
+            msg = (
+                f"🔕 Đã TẮT thông báo CTV {self._names(interaction.guild, changed or owners)}. "
+                "Bạn sẽ không nhận tin khi CTV này live ở bất kỳ kênh nào."
+            )
+        else:
+            await follows.follow(interaction.user.id, owners)
+            self.notify_btn.label = "Tắt Thông Báo"
+            self.notify_btn.style = discord.ButtonStyle.danger
+            msg = (
+                f"✅ Đã BẬT thông báo CTV {self._names(interaction.guild, owners)}. "
+                "Bạn sẽ nhận DM mỗi khi CTV này live (ở bất kỳ kênh nào)."
+            )
 
         await interaction.response.edit_message(view=self)
         await interaction.followup.send(msg, ephemeral=True)

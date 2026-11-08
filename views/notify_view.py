@@ -19,44 +19,21 @@ from discord import ui
 
 from config import DELAY_OPTIONS
 from core.data_manager import db
+from helpers import follows
 from helpers.time_utils import now_vn
 
 log = logging.getLogger(__name__)
 
 
 # =========================================================
-#  TẮT THÔNG BÁO
+#  TẮT THÔNG BÁO (trong DM) — tắt theo CTV, giống nút Tắt ở panel server
 # =========================================================
-def _remove_user_from_channels(subs: dict, uid_str: str, channel_ids) -> list[str]:
-    """Bỏ `uid_str` khỏi danh sách đăng ký của các kênh. Trả về các kênh đã bỏ."""
-    removed: list[str] = []
-    for cid in {str(c) for c in channel_ids}:
-        lst = subs.get(cid)
-        if not isinstance(lst, list):
-            continue
-        before = len(lst)
-        subs[cid] = [u for u in lst if str(u) != uid_str]
-        if len(subs[cid]) != before:
-            removed.append(cid)
-    return removed
-
-
-async def _unsubscribe_and_reply(interaction: discord.Interaction, channel_ids, empty_hint: str):
-    uid_str = str(interaction.user.id)
-    removed: list[str] = []
-
-    def _save(subs):
-        removed.extend(_remove_user_from_channels(subs, uid_str, channel_ids))
-
-    await db.aupdate("subscribers", _save)
-
-    if removed:
-        channels_data = db.load("channels")
-        names = ", ".join(f"**{channels_data.get(c, {}).get('name', f'Kênh {c}')}**" for c in removed)
-        await interaction.followup.send(f"✅ Đã tắt thông báo kênh: {names}.", ephemeral=True)
-        log.info(f"User {uid_str} tắt thông báo qua DM: {removed}")
-    else:
-        await interaction.followup.send(empty_hint, ephemeral=True)
+def _ctv_names(client, ctv_ids) -> str:
+    names = []
+    for x in ctv_ids:
+        user = client.get_user(int(x)) if str(x).isdigit() else None
+        names.append(f"**{user.display_name}**" if user else f"<@{x}>")
+    return ", ".join(names)
 
 
 class NotifyOffCTVButton(
@@ -64,11 +41,8 @@ class NotifyOffCTVButton(
     template=r"notify_off_ctv:(?P<uid>\d+)",
 ):
     """
-    Nút Tắt Thông Báo trong DM báo live (bản mới).
-
-    Gắn theo CTV đang live: khách nhận DM vì đã bật thông báo ở 1 hay nhiều kênh
-    do CTV này quản lý → bấm nút sẽ tắt đăng ký ở TẤT CẢ các kênh đó, bất kể CTV
-    đang live ở kênh nào.
+    Nút Tắt Thông Báo trong DM báo live: bỏ theo dõi đúng CTV đã gửi tin này,
+    bất kể CTV đó đang live ở kênh nào.
     """
 
     def __init__(self, ctv_id):
@@ -89,13 +63,18 @@ class NotifyOffCTVButton(
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        managed = db.load("ctv").get(self.ctv_id) or []
-        await _unsubscribe_and_reply(
-            interaction,
-            managed,
-            "ℹ️ Bạn không còn đăng ký kênh nào của CTV này. "
-            "Muốn chỉnh từng kênh, vào kênh chọn live và chọn kênh đó.",
-        )
+        removed = await follows.unfollow(interaction.user.id, [self.ctv_id])
+        if removed:
+            await interaction.followup.send(
+                f"✅ Đã tắt thông báo CTV {_ctv_names(interaction.client, removed)}. "
+                "Bạn sẽ không nhận tin khi CTV này live nữa.",
+                ephemeral=True,
+            )
+            log.info(f"User {interaction.user.id} bỏ theo dõi CTV {self.ctv_id} (qua DM)")
+        else:
+            await interaction.followup.send(
+                "ℹ️ Bạn đã tắt thông báo CTV này rồi.", ephemeral=True,
+            )
 
 
 class NotifyOffButton(
@@ -103,10 +82,8 @@ class NotifyOffButton(
     template=r"notify_off:(?P<cid>\d+)",
 ):
     """
-    Nút Tắt Thông Báo trong các DM CŨ (gửi trước bản sửa lỗi).
-
-    custom_id cũ chứa kênh đang live chứ không phải kênh khách đăng ký, nên bỏ
-    đăng ký ở kênh đó + mọi kênh của các CTV chủ kênh đó.
+    Nút Tắt Thông Báo trong các DM CŨ (custom_id chứa kênh đang live, không có CTV).
+    Bỏ theo dõi các CTV chủ kênh đó.
     """
 
     def __init__(self, channel_id):
@@ -127,17 +104,22 @@ class NotifyOffButton(
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        ctv_data = db.load("ctv")
-        channel_ids = {self.channel_id}
-        for chans in ctv_data.values():
-            if isinstance(chans, list) and self.channel_id in chans:
-                channel_ids.update(str(c) for c in chans)
-        await _unsubscribe_and_reply(
-            interaction,
-            channel_ids,
-            "ℹ️ Tin nhắn này là bản cũ nên bot không xác định được kênh bạn đã đăng ký. "
-            "Vào kênh chọn live, chọn kênh bạn đã bật thông báo rồi bấm **Tắt Thông Báo**.",
-        )
+        owners = [
+            str(uid) for uid, chans in db.load("ctv").items()
+            if isinstance(chans, list) and self.channel_id in chans
+        ]
+        removed = await follows.unfollow(interaction.user.id, owners) if owners else []
+        if removed:
+            await interaction.followup.send(
+                f"✅ Đã tắt thông báo CTV {_ctv_names(interaction.client, removed)}.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                "ℹ️ Tin nhắn này là bản cũ nên bot không xác định được CTV. "
+                "Vào kênh chọn live, chọn kênh của CTV đó rồi bấm **Tắt Thông Báo**.",
+                ephemeral=True,
+            )
 
 
 # =========================================================

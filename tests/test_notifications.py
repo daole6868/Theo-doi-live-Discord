@@ -51,7 +51,7 @@ class LiveNotifyTests(unittest.IsolatedAsyncioTestCase):
         db.save("live_state", {})
         state.load_from_disk()
         db.save("ctv", {"1": ["100"], "2": ["200"]})
-        db.save("subscribers", {"100": ["900"], "200": ["901"]})
+        db.save("ctv_subscribers", {"1": ["900"], "2": ["901"]})
         db.save("next_live", {
             "1": {"time": now_ts() + 3600, "time_str": "20:00", "channel_id": "100", "reminders_sent": 0},
             "2": {"time": now_ts() + 3600, "time_str": "21:00", "channel_id": "200", "reminders_sent": 0},
@@ -155,55 +155,109 @@ class NextLiveMigrationTests(unittest.TestCase):
         self.assertEqual(len(db.load("next_live")), 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-class UnsubscribeTests(unittest.IsolatedAsyncioTestCase):
-    """Lỗi cũ: nút Tắt Thông Báo trong DM tắt nhầm kênh đang live → khách vẫn nhận DM."""
+class FollowCTVTests(unittest.IsolatedAsyncioTestCase):
+    """Bật/Tắt thông báo theo CTV — nút ở panel server và nút trong DM phải giống nhau."""
 
     async def asyncSetUp(self):
-        db.save("ctv", {"1": ["100", "101"]})
-        db.save("channels", {"100": {"name": "Kênh A", "role_id": 0}, "101": {"name": "Kênh C", "role_id": 0}})
-        db.save("subscribers", {"100": ["900"], "101": ["900", "901"]})
+        # CTV 1 quản kênh 100 + 101; CTV 2 quản kênh 101 (kênh chung) + 200
+        db.save("ctv", {"1": ["100", "101"], "2": ["101", "200"]})
+        db.save("channels", {c: {"name": f"Kênh {c}", "role_id": 0} for c in ("100", "101", "200")})
+        db.save("ctv_subscribers", {})
 
-    def _inter(self, uid):
-        return NS(user=NS(id=uid), response=NS(defer=mock.AsyncMock()), followup=NS(send=mock.AsyncMock()))
+    def _dm_inter(self, uid):
+        return NS(user=NS(id=uid), client=NS(get_user=lambda i: None),
+                  response=NS(defer=mock.AsyncMock()), followup=NS(send=mock.AsyncMock()))
 
-    async def test_dm_built_with_ctv_button_and_reason(self):
+    def _panel_inter(self, uid):
+        return NS(user=NS(id=uid), guild=NS(get_member=lambda i: None),
+                  response=NS(edit_message=mock.AsyncMock(), send_message=mock.AsyncMock()),
+                  followup=NS(send=mock.AsyncMock()))
+
+    async def _panel_toggle(self, uid, channel_id):
+        from views.user_view import CustomerView
+        view = CustomerView(channel_id, 1, False, uid)
+        await view.toggle_notify(self._panel_inter(uid))
+        return view
+
+    async def test_panel_on_then_dm_off_is_same_as_panel_off(self):
+        from helpers import follows
+        from views.notify_view import NotifyOffCTVButton
+        await self._panel_toggle(900, "100")                       # bật ở kênh 100 → theo dõi CTV 1
+        self.assertEqual(follows.following(900, ["1", "2"]), ["1"])
+
+        await NotifyOffCTVButton("1").callback(self._dm_inter(900))  # tắt trong DM của CTV 1
+        self.assertEqual(follows.following(900, ["1", "2"]), [])
+        # Panel kênh 100 và kênh 101 (cùng CTV 1) đều hiện lại "Bật Thông Báo"
+        from views.user_view import CustomerView
+        self.assertEqual(CustomerView("100", 1, False, 900).notify_btn.label, "Bật Thông Báo")
+
+    async def test_panel_off_stops_dm_from_any_channel_of_ctv(self):
+        from helpers import follows
+        await self._panel_toggle(900, "100")       # bật
+        await self._panel_toggle(900, "100")       # tắt ở panel
+        self.assertEqual(follows.followers_of("1"), [])
+
+    async def test_followers_get_dm_wherever_ctv_lives(self):
+        from helpers import follows
+        await follows.follow(900, ["1"])
+        await follows.follow(901, ["1"])
         sent = {}
-        users = {}
 
         def get_user(uid):
-            users.setdefault(uid, NS(send=mock.AsyncMock(side_effect=lambda **kw: sent.setdefault(uid, kw))))
-            return users[uid]
+            return NS(send=mock.AsyncMock(side_effect=lambda **kw: sent.setdefault(uid, kw)))
 
         bot = FakeBot()
         bot.get_user = get_user
         cog = live_tracker_cog.LiveTrackerCog(bot)
-        live_channel = NS(id=555, name="Kênh khác", guild=NS(id=1))   # CTV live ở kênh KHÔNG ai đăng ký
+        live_channel = NS(id=555, name="Kênh khác", guild=NS(id=1))   # CTV 1 live ở kênh lạ
         await cog._notify_subscribers(live_channel, NS(id=1, display_name="CTV1"))
 
         self.assertEqual(sorted(sent), [900, 901])
         ids = [c.custom_id for c in sent[900]["view"].children if getattr(c, "custom_id", None)]
         self.assertEqual(ids, ["notify_off_ctv:1"])
-        self.assertIn("Kênh A, Kênh C", sent[900]["embed"].description)
-        self.assertIn("Kênh C", sent[901]["embed"].description)
+        self.assertIn("CTV CTV1", sent[900]["embed"].description)
 
-    async def test_ctv_off_button_removes_all_subscribed_channels(self):
+    async def test_shared_channel_panel_follows_all_owners_dm_off_only_one(self):
+        from helpers import follows
         from views.notify_view import NotifyOffCTVButton
-        inter = self._inter(900)
-        await NotifyOffCTVButton("1").callback(inter)
-        self.assertEqual(db.load("subscribers"), {"100": [], "101": ["901"]})
-        self.assertIn("Đã tắt", inter.followup.send.await_args.args[0])
+        await self._panel_toggle(900, "101")                       # kênh chung của CTV 1 và 2
+        self.assertEqual(sorted(follows.following(900, ["1", "2"])), ["1", "2"])
+        await NotifyOffCTVButton("2").callback(self._dm_inter(900))  # tắt trong DM của CTV 2
+        self.assertEqual(follows.following(900, ["1", "2"]), ["1"])
 
-    async def test_legacy_button(self):
+    async def test_channel_without_ctv(self):
+        from views.user_view import CustomerView
+        db.save("channels", {"300": {"name": "Trống", "role_id": 0}})
+        view = CustomerView("300", 1, False, 900)
+        self.assertTrue(view.notify_btn.disabled)
+
+    async def test_legacy_dm_button(self):
+        from helpers import follows
         from views.notify_view import NotifyOffButton
-        inter = self._inter(900)
-        await NotifyOffButton("100").callback(inter)          # kênh của CTV → tắt cả kênh của CTV đó
-        self.assertEqual(db.load("subscribers"), {"100": [], "101": ["901"]})
-
-        inter = self._inter(901)
-        await NotifyOffButton("555").callback(inter)          # kênh lạ → hướng dẫn tắt trong panel
-        self.assertEqual(db.load("subscribers")["101"], ["901"])
+        await follows.follow(900, ["1"])
+        await NotifyOffButton("100").callback(self._dm_inter(900))
+        self.assertEqual(follows.followers_of("1"), [])
+        inter = self._dm_inter(901)
+        await NotifyOffButton("555").callback(inter)
         self.assertIn("kênh chọn live", inter.followup.send.await_args.args[0])
+
+
+class SubscribersMigrationTests(unittest.TestCase):
+    def test_channel_subs_become_ctv_follows(self):
+        from config import LEGACY_SUBS_JSON
+        import json as _json
+        db.save("ctv", {"1": ["100", "101"], "2": ["101"]})
+        db.save("ctv_subscribers", {})
+        LEGACY_SUBS_JSON.write_text(_json.dumps(
+            {"100": ["900"], "101": [900, "901"], "999": ["902"]}), encoding="utf-8")
+        store = SessionStore(":memory:")
+        with mock.patch.object(migration, "store", store):
+            migration.migrate_subscribers_to_ctv()
+            migration.migrate_subscribers_to_ctv()
+        self.assertEqual(db.load("ctv_subscribers"), {"1": ["900", "901"], "2": ["900", "901"]})
+        self.assertFalse(LEGACY_SUBS_JSON.exists())
+        store.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

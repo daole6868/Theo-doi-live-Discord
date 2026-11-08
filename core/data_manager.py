@@ -75,7 +75,7 @@ class DataManager:
         Đây là cách AN TOÀN NHẤT để cập nhật 1 phần của file.
 
         Ví dụ:
-            await db.aupdate("subscribers", lambda subs: subs.setdefault(cid, []).append(uid))
+            await db.aupdate("ctv_subscribers", lambda subs: subs.setdefault(ctv_id, []).append(uid))
         """
         async with self._locks[key]:
             data = self.load(key)

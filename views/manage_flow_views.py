@@ -23,6 +23,7 @@ from discord import ui
 
 from core.data_manager import db
 from core.session_store import store
+from helpers import follows
 from helpers.panels import refresh_panel, resync_tracking
 
 log = logging.getLogger(__name__)
@@ -81,7 +82,6 @@ class ManageChannelSelect(ui.ChannelSelect):
 
         channels = db.load("channels")
         ctv_data = db.load("ctv")
-        subs = db.load("subscribers")
 
         info = channels.get(cid, {})
         name = info.get("name", "?")
@@ -91,7 +91,8 @@ class ManageChannelSelect(ui.ChannelSelect):
             1 for uid, chs in ctv_data.items()
             if isinstance(chs, list) and cid in chs
         )
-        sub_count = len(subs.get(cid, []))
+        owners = [uid for uid, chs in ctv_data.items() if isinstance(chs, list) and cid in chs]
+        sub_count = follows.count_followers(owners)
 
         embed = discord.Embed(
             title=f"🔧 Quản lý kênh: {name}",
@@ -100,7 +101,7 @@ class ManageChannelSelect(ui.ChannelSelect):
                 f"**ID:** `{cid}`\n"
                 f"**Role ID:** `{role_id}`\n"
                 f"**CTV quản lý:** {ctv_count}\n"
-                f"**Subscribers:** {sub_count}\n\n"
+                f"**Khách theo dõi CTV kênh này:** {sub_count}\n\n"
                 "Chọn thao tác bên dưới:"
             ),
             color=discord.Color.blurple(),
@@ -141,11 +142,12 @@ class ChannelActionView(ui.View):
                 f"Xóa kênh **{self.channel_name}** khỏi hệ thống Bot?\n\n"
                 "**SẼ LÀM:**\n"
                 "• Xóa khỏi danh sách kênh của Bot\n"
-                "• Xóa tất cả CTV/Subscribers liên kết kênh này\n\n"
+                "• Bỏ liên kết các CTV với kênh này\n\n"
                 "**KHÔNG động vào:**\n"
                 "• Voice Channel Discord (vẫn còn)\n"
                 "• Role Discord (vẫn còn)\n"
                 "• Lịch sử live (vẫn giữ nguyên)\n"
+                "• Khách theo dõi CTV (vẫn nhận báo khi CTV live)\n"
                 "• Phiên đang live (vẫn được tính tiếp)"
             ),
             color=discord.Color.orange(),
@@ -207,17 +209,17 @@ class ChannelActionView(ui.View):
         else:
             done.append("✓ Bỏ khỏi CTV quản lý")
 
-        # 3. Xóa subscribers
-        def _rm_subs(data):
-            data.pop(cid, None)
-        await db.aupdate("subscribers", _rm_subs)
-        done.append("✓ Xóa subscribers")
+        # 4. Xóa lịch live tiếp theo đang trỏ tới kênh này (lịch lưu theo CTV)
+        removed_nl = 0
 
-        # 4. Xóa next_live
         def _rm_nl(data):
-            data.pop(cid, None)
+            nonlocal removed_nl
+            for uid in [u for u, info in data.items()
+                        if isinstance(info, dict) and str(info.get("channel_id")) == cid]:
+                data.pop(uid, None)
+                removed_nl += 1
         await db.aupdate("next_live", _rm_nl)
-        done.append("✓ Xóa lịch live tiếp theo")
+        done.append(f"✓ Xóa {removed_nl} lịch live tiếp theo của kênh này")
 
         # 5. Xóa Discord voice channel + role (nếu chọn xóa hoàn toàn)
         if delete_discord:

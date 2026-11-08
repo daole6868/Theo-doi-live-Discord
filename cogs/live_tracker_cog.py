@@ -9,7 +9,7 @@ Live Tracker Cog — tính giờ LIVE (chia sẻ màn hình) và AUDIO cho từn
 - Nhịp tim mỗi 30 giây.
 
 Khi CTV bắt đầu LIVE (ở bất kỳ kênh nào): hủy lịch nhắc của chính CTV đó và báo
-ngay cho khách đăng ký các kênh CTV đó quản lý (giới hạn tần suất bằng
+ngay cho khách đang theo dõi CTV đó (giới hạn tần suất bằng
 NOTIFY_COOLDOWN_MINUTES trong config.py, mặc định 0 = báo mỗi lần bật live).
 Khi CTV tắt LIVE: chờ 2 phút, nếu không bật lại thì DM hỏi giờ live tiếp theo.
 """
@@ -34,6 +34,7 @@ from core.data_manager import db
 from core.session_store import store
 from core.state import state
 from core.tracker import Change, Tracker, desired_from_voice
+from helpers import follows
 from helpers.embeds import clamp_embed, get_custom_embed
 from helpers.stats import channel_name
 from helpers.time_utils import fmt_dur, now_ts
@@ -267,25 +268,15 @@ class LiveTrackerCog(commands.Cog):
 
     async def _notify_subscribers(self, channel, member: discord.Member) -> None:
         """
-        DM cho khách đăng ký BẤT KỲ kênh nào mà CTV này quản lý (mỗi khách 1 tin).
-        CTV live ở kênh khác → link dẫn tới kênh đang live thực tế.
-        Nút "Tắt Thông Báo" trong DM gắn theo CTV → tắt đúng các kênh khách đã đăng ký.
+        DM cho mọi khách đang theo dõi CTV này (helpers/follows.py).
+        CTV live ở kênh nào thì link dẫn tới đúng kênh đó.
+        Nút "Tắt Thông Báo" trong DM bỏ theo dõi đúng CTV này — giống nút Tắt ở panel.
         """
-        ctv_data = db.load("ctv")
-        channels_data = db.load("channels")
-        managed_channels = [str(c) for c in ctv_data.get(str(member.id), [])]
-        subs_data = db.load("subscribers")
-
-        # khách → các kênh (của CTV này) mà khách đã bật thông báo
-        reasons: dict[str, list[str]] = {}
-        for ch_id in managed_channels:
-            for uid in subs_data.get(ch_id, []):
-                reasons.setdefault(str(uid), []).append(ch_id)
-
-        if not reasons:
+        followers = follows.followers_of(member.id)
+        if not followers:
             return
 
-        base = get_custom_embed(
+        embed = get_custom_embed(
             EMBED_LIVE_NOTIF,
             title=f"🔴 CTV **{member.display_name}** đang LIVE!",
             desc=(
@@ -294,18 +285,17 @@ class LiveTrackerCog(commands.Cog):
             ),
             color=discord.Color.red(),
         )
+        embed.description = (embed.description or "") + (
+            f"\n\n*Bạn nhận tin này vì đã bật thông báo CTV {member.display_name}.*"
+        )
+        embed = clamp_embed(embed)
         view = NotifyView(channel.id, channel.guild.id, ctv_id=member.id)
 
         sent = failed = 0
-        for uid, chans in reasons.items():
-            names = ", ".join(channels_data.get(c, {}).get("name", f"Kênh {c}") for c in chans)
-            embed = base.copy()
-            embed.description = (embed.description or "") + (
-                f"\n\n*Bạn nhận tin này vì đã bật thông báo kênh: {names}.*"
-            )
+        for uid in followers:
             try:
                 user = self.bot.get_user(int(uid)) or await self.bot.fetch_user(int(uid))
-                await user.send(embed=clamp_embed(embed), view=view)
+                await user.send(embed=embed, view=view)
                 sent += 1
             except (discord.Forbidden, discord.HTTPException) as e:
                 failed += 1
@@ -315,8 +305,8 @@ class LiveTrackerCog(commands.Cog):
                 log.exception(f"Lỗi gửi DM tới {uid}")
 
         log.info(
-            f"Đã DM live tới {sent}/{len(reasons)} khách (lỗi: {failed}). "
-            f"CTV {member.display_name} → {len(managed_channels)} kênh quản lý."
+            f"Đã DM live tới {sent}/{len(followers)} khách theo dõi CTV {member.display_name} "
+            f"(lỗi: {failed}) — đang live tại #{channel.name}"
         )
 
     async def _on_stream_end(self, c: Change) -> None:

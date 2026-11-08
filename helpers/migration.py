@@ -7,7 +7,7 @@ Idempotent — chạy nhiều lần không sao.
 import json
 import logging
 
-from config import KIND_STREAM, LEGACY_SESSIONS_JSON
+from config import KIND_STREAM, LEGACY_SESSIONS_JSON, LEGACY_SUBS_JSON
 from core.data_manager import db
 from core.session_store import store
 
@@ -155,6 +155,62 @@ def migrate_next_live_per_user():
     log.info(f"✓ Migrate: chuyển {len(new)} lịch live tiếp theo sang key theo CTV")
 
 
+def migrate_subscribers_to_ctv():
+    """
+    Đăng ký thông báo: đổi từ theo KÊNH sang theo CTV.
+
+    Cũ:  data_subs.json      {channel_id: [khách]}
+    Mới: data_ctv_subs.json  {ctv_id: [khách]}
+    Khách đã bật thông báo ở kênh X → theo dõi các CTV chủ kênh X.
+    Kênh không có CTV chủ thì trước đây cũng không bao giờ gửi thông báo → bỏ.
+    """
+    if store.get_meta("migrated_subs_by_ctv") == "1":
+        return
+    path = LEGACY_SUBS_JSON
+    if not path.exists():
+        store.set_meta("migrated_subs_by_ctv", "1")
+        return
+    try:
+        old = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except json.JSONDecodeError as e:
+        log.error(f"data_subs.json lỗi định dạng ({e}) — bỏ qua migrate, giữ nguyên file")
+        return
+
+    ctv_data = db.load("ctv")
+    owners_of: dict[str, list[str]] = {}
+    for uid, chans in ctv_data.items():
+        if isinstance(chans, list):
+            for c in chans:
+                owners_of.setdefault(str(c), []).append(str(uid))
+
+    new = db.load("ctv_subscribers")
+    moved = dropped = 0
+    for cid, customers in (old.items() if isinstance(old, dict) else []):
+        if not isinstance(customers, list):
+            continue
+        owners = owners_of.get(str(cid), [])
+        if not owners:
+            dropped += len(customers)
+            continue
+        for owner in owners:
+            lst = new.setdefault(owner, [])
+            for cust in customers:
+                if str(cust) not in [str(x) for x in lst]:
+                    lst.append(str(cust))
+                    moved += 1
+
+    db.save("ctv_subscribers", new)
+    store.set_meta("migrated_subs_by_ctv", "1")
+    try:
+        path.rename(path.with_name(path.name + ".migrated"))
+    except OSError:
+        log.exception("Đổi tên data_subs.json lỗi (dữ liệu đã chuyển xong)")
+    log.info(
+        f"✓ Migrate: chuyển đăng ký thông báo sang theo CTV — {moved} lượt theo dõi "
+        f"(bỏ {dropped} đăng ký ở kênh không có CTV)"
+    )
+
+
 def run_all_migrations():
     """Gọi trong setup_hook của main.py."""
     log.info("=" * 40)
@@ -175,5 +231,9 @@ def run_all_migrations():
         migrate_next_live_per_user()
     except Exception:
         log.exception("migrate_next_live_per_user lỗi")
+    try:
+        migrate_subscribers_to_ctv()
+    except Exception:
+        log.exception("migrate_subscribers_to_ctv lỗi")
     log.info("Migrations xong.")
     log.info("=" * 40)

@@ -82,7 +82,7 @@ VN_TZ = datetime.timezone(datetime.timedelta(hours=7), name="Asia/Ho_Chi_Minh")
 DATA_FILES = {
     "channels":       DATA_DIR / "data_channels.json",
     "ctv":            DATA_DIR / "data_ctv.json",
-    "subscribers":    DATA_DIR / "data_subs.json",
+    "ctv_subscribers": DATA_DIR / "data_ctv_subs.json",  # khách theo dõi CTV: {ctv_id: [khách]}
     "embeds":         DATA_DIR / "data_embeds.json",
     "next_live":      DATA_DIR / "data_next_live.json",
     "live_state":     DATA_DIR / "data_live_state.json",
@@ -95,6 +95,8 @@ DATA_FILES = {
 # File JSON cũ `data_sessions.json` được chuyển sang đây tự động ở lần chạy đầu.
 SESSIONS_DB_FILE = DATA_DIR / "sessions.db"
 LEGACY_SESSIONS_JSON = DATA_DIR / "data_sessions.json"
+# Đăng ký thông báo kiểu cũ (theo kênh) — tự chuyển sang theo CTV ở lần chạy đầu
+LEGACY_SUBS_JSON = DATA_DIR / "data_subs.json"
 
 
 # =========================================================
