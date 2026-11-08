@@ -1,0 +1,35 @@
+[Unit]
+Description=Gachaz Live Bot - Discord CTV Manager
+Documentation=https://github.com/your-repo/gachaz-live-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/gachaz-live-bot
+
+# Python venv path
+Environment="PATH=/opt/gachaz-live-bot/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+
+# Command
+ExecStart=/opt/gachaz-live-bot/.venv/bin/python /opt/gachaz-live-bot/main.py
+
+# Restart policy
+Restart=always
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=5
+
+# Logging → journalctl
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gachaz-bot
+
+# Resource limits (optional, tránh runaway)
+MemoryLimit=1G
+
+[Install]
+WantedBy=multi-user.target

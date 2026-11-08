@@ -1,0 +1,25 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.venv/
+venv/
+
+# Logs
+logs/
+*.log
+
+# Data (backup thủ công, không commit dữ liệu runtime)
+data/*.json
+!data/.keep
+
+# IDE
+.vscode/
+.idea/
+*.swp
